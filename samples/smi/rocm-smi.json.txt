@@ -1,0 +1,19 @@
+{
+  "card0": {
+    "Card Series": "Radeon Instinct MI50",
+    "GPU use (%)": "87",
+    "VRAM Total Memory (B)": "34359738368",
+    "VRAM Total Used Memory (B)": "17179869184",
+    "Temperature (Sensor edge) (C)": "54.0",
+    "Temperature (Sensor junction) (C)": "61.0",
+    "Average Graphics Package Power (W)": "180.0"
+  },
+  "card1": {
+    "Card Series": "Radeon Instinct MI50",
+    "GPU use (%)": "0",
+    "VRAM Total Memory (B)": "34359738368",
+    "VRAM Total Used Memory (B)": "8589934592",
+    "Temperature (Sensor edge) (C)": "47.0",
+    "Average Graphics Package Power (W)": "95.0"
+  }
+}

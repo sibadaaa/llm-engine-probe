@@ -1,0 +1,15 @@
+# 厂商 overlay：Intel GPU（XPU）
+#
+# 用法（项目根目录）：
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.intel.yml up -d vllm
+#   EXEC_CONTAINER=vllm-probe-c scripts/start_vllm.sh --exec
+
+services:
+  vllm:
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+    environment:
+      ZE_AFFINITY_MASK: ${VISIBLE_DEVICES:-0}
+      PYTHONPATH: ${PYTHONPATH_IN_CONTAINER:-/opt/vllm-probe}

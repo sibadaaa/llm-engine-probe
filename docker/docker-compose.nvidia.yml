@@ -1,0 +1,20 @@
+# 厂商 overlay：NVIDIA CUDA
+#
+# 前置条件：宿主机已安装 NVIDIA 驱动 + nvidia-container-toolkit，
+# 且 `docker run --gpus all` 可用（Docker >= 19.03）。
+#
+# 用法（项目根目录）：
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.nvidia.yml up -d vllm
+#   EXEC_CONTAINER=vllm-probe-c scripts/start_vllm.sh --exec
+#
+# 模型目录等自定义挂载请写在 docker-compose.override.yml 里（compose 会自动叠加）。
+
+services:
+  vllm:
+    # 等价于 docker run --gpus all（需要较新的 compose；老版本可改用:
+    #   deploy: {resources: {reservations: {devices: [{driver: nvidia, count: all, capabilities: [gpu]}]}}}
+    gpus: all
+    environment:
+      CUDA_VISIBLE_DEVICES: ${VISIBLE_DEVICES:-0}
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      PYTHONPATH: ${PYTHONPATH_IN_CONTAINER:-/opt/vllm-probe}

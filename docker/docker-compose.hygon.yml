@@ -1,0 +1,29 @@
+# 厂商 overlay：Hygon DCU（DTK / ROCm 系）
+#
+# 用法（项目根目录）：
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.hygon.yml up -d vllm
+#   EXEC_CONTAINER=vllm-probe-c scripts/start_vllm.sh --exec
+#
+# 说明：docker compose 对 `devices:` 列表是**追加合并**，因此基础文件里不能
+#       预设有厂商倾向的设备；本 overlay 单独补齐。
+
+services:
+  vllm:
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/mkfd:/dev/mkfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+    volumes:
+      - /opt/hyhal:/opt/hyhal:ro
+      - ${SRC_DIR:-/home/lyh/z100-vllm}:/src:ro
+      - ${GAME_DIR:-/mnt/game}:${GAME_DIR:-/mnt/game}
+    environment:
+      HIP_VISIBLE_DEVICES: ${VISIBLE_DEVICES:-0,1,2,3}
+      PYTORCH_HIP_ALLOC_CONF: expandable_segments:True
+      HSA_FORCE_FINE_GRAIN_PCIE: ${HSA_FORCE_FINE_GRAIN_PCIE:-1}
+      VLLM_CACHE_ROOT: ${VLLM_CACHE_ROOT:-/mnt/game/vllm-cache-probe}
+      TRITON_CACHE_DIR: ${TRITON_CACHE_DIR:-/mnt/game/triton-gfx906/cache}
+      PYTHONPATH: ${PYTHONPATH_IN_CONTAINER:-/src:/opt/vllm-probe}
+    working_dir: /src

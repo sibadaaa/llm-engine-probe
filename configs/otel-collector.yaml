@@ -1,0 +1,93 @@
+# ============================================================================
+# OpenTelemetry Collector (contrib) 配置 — vllm-docker-probe 可选链路追踪
+#
+# 【vLLM 侧必须这样启动】否则 collector 收不到任何 span：
+#   --otlp-traces-endpoint http://otel-collector:4317
+# 只要给了这个端点，vLLM 就会为每个请求产出 `llm_request` span
+# （vllm/v1/engine/output_processor.py::do_tracing，本机 0.18.1+das 已确认存在），
+# 属性含 gen_ai.latency.time_to_first_token / e2e / time_in_queue /
+# time_in_model_prefill / time_in_model_decode、gen_ai.usage.*、gen_ai.request.id。
+# 客户端用响应头 X-Request-Id 与 span 的 gen_ai.request.id 对齐（vLLM 不回传 trace id）。
+#
+# ⚠️ 不要加 `--collect-detailed-traces`：在本版本（0.18.1+das）它**只做参数校验**，
+#    两个消费者属性 collect_model_forward_time / collect_model_execute_time
+#    在全树没有任何读取方，/metrics 里也没有 vllm:model_forward_time_milliseconds，
+#    因此不会带来额外数据。需要 model forward/execute 细分请用 torch profiler
+#    （scripts/trace_capture.sh，见 README 第 6.4 节）。
+# 说明：vLLM 用 OTLP/gRPC 推送 trace（协议由 OTEL_EXPORTER_OTLP_TRACES_PROTOCOL
+#       决定，默认 grpc）；开启追踪对性能有轻微影响，取性能基线时请关掉。
+#
+# 本地查看：日志里直接看结构化 span（debug exporter，verbosity: detailed）
+#   docker compose -f docker/docker-compose.yml \
+#                  -f docker/docker-compose.obs.yml --profile obs logs -f otel-collector
+# 接 Jaeger：把下面 exporters.otlp/jaeger 与 pipelines 里的注释打开即可。
+#
+# 【环境变量替换】${env:VAR} 只有在 collector 通过 `--config` 加载配置文件时
+#   才会被替换（官方镜像 entrypoint 即 otelcol-contrib --config ...，因此可用）；
+#   若改用 `--config=file:...` / 远端 URI 方式加载则不做替换。
+# ============================================================================
+
+receivers:
+  # vLLM 默认的 OTLP 入口（容器内 4317 gRPC / 4318 HTTP）
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # 放在 batch 之前：先做内存保护，超限时丢弃/拒绝，避免 OOM。
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 20
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+
+exporters:
+  # 默认导出：把 span 打到 collector 自己的日志（stdout），零外部依赖。
+  debug:
+    verbosity: detailed
+  # --------------------------------------------------------------------------
+  # 可选后端：Jaeger / Tempo（OTLP gRPC）。
+  # 使用前先在 compose 里给 otel-collector 加环境变量，例如
+  #   JAEGER_ENDPOINT: jaeger:4317
+  # 再把下面的 exporter 与 service.pipelines 中 [debug] 换成 [debug, otlp/jaeger]。
+  # --------------------------------------------------------------------------
+  # otlp/jaeger:
+  #   endpoint: ${env:JAEGER_ENDPOINT}
+  #   tls:
+  #     insecure: true
+  #   retry_on_failure:
+  #     enabled: true
+  #   sending_queue:
+  #     enabled: true
+
+extensions:
+  # 容器内健康检查端口（compose 未对外发布，仅集群内可见）：
+  #   docker compose ... exec otel-collector wget -qO- localhost:13133
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      # collector 自身指标暴露在 8888（compose 未发布，可按需打开）
+      level: basic
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [debug]
+    # vLLM 目前主要通过 /metrics 暴露指标；此处保留 OTLP metrics 管道，
+    # 方便后续把引擎内部指标改走 OTLP 推送。
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [debug]

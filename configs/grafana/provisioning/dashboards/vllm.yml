@@ -1,0 +1,22 @@
+# ============================================================================
+# Grafana Dashboard Provider（从磁盘目录加载 dashboard JSON）
+# JSON 目录挂载：./configs/grafana/dashboards -> /var/lib/grafana/dashboards
+# 本文件负责把该目录注册为 provider "vllm"，folder 为 vLLM。
+# ============================================================================
+apiVersion: 1
+
+providers:
+  - name: vllm
+    orgId: 1
+    folder: vLLM
+    type: file
+    # 允许在 UI 中删除（文件仍在磁盘上，30s 后会被重新加载）
+    disableDeletion: false
+    # 允许 UI 直接改面板，方便临时调 PromQL；改动不会回写 JSON 文件
+    allowUiUpdates: true
+    updateIntervalSeconds: 30
+    options:
+      # 与 overlay 中的 ../configs/grafana/dashboards:/var/lib/grafana/dashboards:ro 对应
+      path: /var/lib/grafana/dashboards
+      # 目录是平铺的（不按子目录建 folder），全部落到 folder: vLLM
+      foldersFromFilesStructure: false

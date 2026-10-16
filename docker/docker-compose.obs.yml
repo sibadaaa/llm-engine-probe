@@ -1,0 +1,87 @@
+# ============================================================================
+# vllm-docker-probe — 可选观测栈 overlay（Prometheus + Grafana + OTel Collector）
+#
+# 这是 docker/docker-compose.yml（base，定义 vllm 服务与 probe-net 网络）的
+# 叠加文件，本身不声明 networks（复用 base 的 probe-net），也没有 version 键。
+#
+# 启动（必须在项目根目录执行，保证 ../configs/... 相对 docker/ 解析正确）：
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.obs.yml \
+#                  --profile obs up -d
+# 关闭：
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.obs.yml \
+#                  --profile obs down          # 加 -v 可同时删除 prom-data/grafana-data/otel-data
+#
+# 端口（宿主侧均可用环境变量覆盖）：
+#   vLLM         ${PORT:-8100}      -> 容器 8000（由 base 文件定义，本文件不改动）
+#   Prometheus   ${PROM_PORT:-9090} -> 9090
+#   Grafana      ${GRAFANA_PORT:-3000} -> 3000   （admin / ${GRAFANA_PASS:-admin}）
+#   OTLP gRPC    4317 / OTLP HTTP 4318（otel-collector，固定端口）
+#
+# 挂载路径一律写成 ../configs/...（相对本文件所在的 docker/ 目录），
+# 因此只能在项目根目录用上面的 -f 组合方式运行。
+# ============================================================================
+
+services:
+  # --------------------------------------------------------------------------
+  # Prometheus：抓取 vllm:8000/metrics（见 ../configs/prometheus.yml）
+  # --------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    profiles: ["obs"]
+    restart: unless-stopped
+    ports:
+      - "${PROM_PORT:-9090}:9090"
+    volumes:
+      - ../configs/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # 允许 POST /-/reload 热加载配置：curl -X POST localhost:9090/-/reload
+      - --web.enable-lifecycle
+    networks:
+      - probe-net
+
+  # --------------------------------------------------------------------------
+  # Grafana：数据源与 dashboard 全部由 provisioning 目录自动装载
+  # --------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:11.5.0
+    profiles: ["obs"]
+    restart: unless-stopped
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASS:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ../configs/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../configs/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    networks:
+      - probe-net
+
+  # --------------------------------------------------------------------------
+  # OTel Collector（contrib）：接收 vLLM 的 OTLP trace（端口 4317/4318）
+  # vLLM 侧只需要：--otlp-traces-endpoint http://otel-collector:4317
+  # （逐请求 llm_request span 会自动产生；不要加 --collect-detailed-traces，
+  #   本版本该 flag 是空操作，详见 configs/otel-collector.yaml 顶部说明）
+  # --------------------------------------------------------------------------
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.120.0
+    profiles: ["obs"]
+    restart: unless-stopped
+    ports:
+      - "4317:4317" # OTLP gRPC
+      - "4318:4318" # OTLP HTTP
+    volumes:
+      - ../configs/otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - otel-data:/data
+    networks:
+      - probe-net
+
+# 命名卷（不覆盖 name:，交给 compose 以项目名加前缀管理，避免与其它工程冲突）
+volumes:
+  prom-data:
+  grafana-data:
+  otel-data:

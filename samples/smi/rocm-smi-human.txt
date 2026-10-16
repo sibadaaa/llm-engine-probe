@@ -1,0 +1,16 @@
+============================ ROCm System Management Interface ============================
+=============================== Memory Usage (Bytes) =====================================
+GPU[0]		: VRAM Total Memory (B): 34359738368
+GPU[0]		: VRAM Total Used Memory (B): 17179869184
+GPU[1]		: VRAM Total Memory (B): 34359738368
+GPU[1]		: VRAM Total Used Memory (B): 8589934592
+================================= Temperature ============================================
+GPU[0]		: Temperature (Sensor edge) (C): 54.0
+GPU[1]		: Temperature (Sensor edge) (C): 47.0
+==================================== Power ===============================================
+GPU[0]		: Average Graphics Package Power (W): 180.0
+GPU[1]		: Average Graphics Package Power (W): 95.0
+================================== GPU Use ===============================================
+GPU[0]		: GPU use (%): 87
+GPU[1]		: GPU use (%): 0
+=============================== End of ROCm SMI Log =======================================

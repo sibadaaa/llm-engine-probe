@@ -1,0 +1,17 @@
+# 厂商 overlay：AMD ROCm
+#
+# 用法（项目根目录）：
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.amd.yml up -d vllm
+#   EXEC_CONTAINER=vllm-probe-c scripts/start_vllm.sh --exec
+
+services:
+  vllm:
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+    environment:
+      HIP_VISIBLE_DEVICES: ${VISIBLE_DEVICES:-0}
+      PYTORCH_HIP_ALLOC_CONF: expandable_segments:True
+      PYTHONPATH: ${PYTHONPATH_IN_CONTAINER:-/opt/vllm-probe}

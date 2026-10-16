@@ -1,0 +1,2051 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "多厂商 GPU（NVIDIA/AMD/Hygon/Intel/Ascend）+ vLLM 推理全流程观测：请求生命周期、调度队列、KV/前缀缓存、吞吐与算力、投机解码（DFlash2）。指标来源 http://vllm:8000/metrics（job=vllm，scrape_interval=5s）。",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "collapsed": false,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prom"
+      },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "panels": [],
+      "title": "① 请求生命周期（队列→预填充→解码）",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prom"
+      },
+      "description": "vLLM 请求各阶段耗时（秒）。默认取 p90；把查询里的 0.9 改成 0.5 / 0.99 即为 p50 / p99，复制查询再加 refId 可同时看多个分位。队列等待 = 进入 waiting 队列到开始调度；预填充 Prefill = 首次前向（含 prefix cache 复用）；解码 Decode = 逐 token 生成；端到端 = 完整请求延迟。指标来自 vllm:8000/metrics（vLLM 0.18.x，厂商与模型见 .env / run_meta.json）。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s",
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 1
+      },
+      "id": 2,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.9, sum by (le) (rate(vllm:request_queue_time_seconds_bucket[1m])))",
+          "instant": false,
+          "range": true,
+          "legendFormat": "队列等待 Queue p90",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.9, sum by (le) (rate(vllm:request_prefill_time_seconds_bucket[1m])))",
+          "instant": false,
+          "range": true,
+          "legendFormat": "预填充 Prefill p90",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.9, sum by (le) (rate(vllm:request_decode_time_seconds_bucket[1m])))",
+          "instant": false,
+          "range": true,
+          "legendFormat": "解码 Decode p90",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.9, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket[1m])))",
+          "instant": false,
+          "range": true,
+          "legendFormat": "端到端 E2E p90",
+          "refId": "D"
+        }
+      ],
+      "title": "请求阶段 p50/p90/p99",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prom"
+      },
+      "description": "TTFT 首 token 延迟、ITL 相邻输出 token 间隔、TPOT 每输出 token 平均耗时（秒）。每条曲线由 label_replace 打上 p50/p90/p99 标签，无需重复配置查询。ITL/TPOT 的分位差是判断解码阶段是否被 batch 抢占、KV 是否吃紧的关键；投机解码（草稿模型/MTP）开启后 ITL 分位通常明显下降。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s",
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 1
+      },
+      "id": 3,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "label_replace(histogram_quantile(0.5, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket[1m]))), \"q\", \"p50\", \"\", \"\") or label_replace(histogram_quantile(0.9, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket[1m]))), \"q\", \"p90\", \"\", \"\") or label_replace(histogram_quantile(0.99, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket[1m]))), \"q\", \"p99\", \"\", \"\")",
+          "instant": false,
+          "range": true,
+          "legendFormat": "TTFT 首Token延迟 {{q}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "label_replace(histogram_quantile(0.5, sum by (le) (rate(vllm:inter_token_latency_seconds_bucket[1m]))), \"q\", \"p50\", \"\", \"\") or label_replace(histogram_quantile(0.9, sum by (le) (rate(vllm:inter_token_latency_seconds_bucket[1m]))), \"q\", \"p90\", \"\", \"\") or label_replace(histogram_quantile(0.99, sum by (le) (rate(vllm:inter_token_latency_seconds_bucket[1m]))), \"q\", \"p99\", \"\", \"\")",
+          "instant": false,
+          "range": true,
+          "legendFormat": "ITL 解码Token间隔 {{q}}",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "label_replace(histogram_quantile(0.5, sum by (le) (rate(vllm:request_time_per_output_token_seconds_bucket[1m]))), \"q\", \"p50\", \"\", \"\") or label_replace(histogram_quantile(0.9, sum by (le) (rate(vllm:request_time_per_output_token_seconds_bucket[1m]))), \"q\", \"p90\", \"\", \"\") or label_replace(histogram_quantile(0.99, sum by (le) (rate(vllm:request_time_per_output_token_seconds_bucket[1m]))), \"q\", \"p99\", \"\", \"\")",
+          "instant": false,
+          "range": true,
+          "legendFormat": "TPOT 每输出Token耗时 {{q}}",
+          "refId": "C"
+        }
+      ],
+      "title": "TTFT / ITL / TPOT 分位",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prom"
+      },
+      "description": "vLLM OpenAI 兼容 HTTP Server 侧的高精度（highr）请求耗时直方图，含网关/序列化/调度全链路，可与上面的 e2e_request_latency 对比区分「引擎内」与「HTTP 栈」开销。注意：若在 prometheus.yml 中启用可选的 metric_relabel_configs，它会 drop 掉 http_request_duration_highr_seconds.*，本面板将变空——两者不要同时开。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s",
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      },
+      "id": 4,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(http_request_duration_highr_seconds_bucket[1m])))",
+          "instant": false,
+          "range": true,
+          "legendFormat": "HTTP 端到端 p50",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.9, sum by (le) (rate(http_request_duration_highr_seconds_bucket[1m])))",
+          "instant": false,
+          "range": true,
+          "legendFormat": "HTTP 端到端 p90",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(http_request_duration_highr_seconds_bucket[1m])))",
+          "instant": false,
+          "range": true,
+          "legendFormat": "HTTP 端到端 p99",
+          "refId": "C"
+        }
+      ],
+      "title": "HTTP 端到端延迟",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prom"
+      },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 16
+      },
+      "id": 5,
+      "panels": [],
+      "title": "② 调度与队列",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prom"
+      },
+      "description": "scheduler 当前 RUNNING（正在参与 forward）与 WAITING（排队等待调度）的请求数。等待数持续上涨说明到达速率超过引擎处理能力（或达到 max_num_seqs / KV 容量上限）。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short",
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 17
+      },
+      "id": 6,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "vllm:num_requests_running",
+          "instant": false,
+          "range": true,
+          "legendFormat": "运行中 Running",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "vllm:num_requests_waiting",
+          "instant": false,
+          "range": true,
+          "legendFormat": "等待中 Waiting",
+          "refId": "B"
+        }
+      ],
+      "title": "运行中/等待中请求数",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prom"
+      },
+      "description": "按 reason 标签拆解 waiting 队列构成：capacity = 调度容量受限（max_num_seqs / max_num_batched_tokens / KV 空间等硬容量打满）；deferred = 瞬时约束（LoRA 未加载、KV 传输/PD 分离、blocked/异步因素）导致本轮被顺延，通常下一轮即可调度。若 capacity 长期占主导，应上调容量或加副本；若 deferred 占主导则多为短时抖动。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short",
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 17
+      },
+      "id": 7,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "sum by (reason) (vllm:num_requests_waiting_by_reason)",
+          "instant": false,
+          "range": true,
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "title": "等待原因分解",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prom"
+      },
+      "description": "每秒发生的请求抢占（preemption）次数。出现抢占说明 KV cache 不足、scheduler 被迫换出/重算序列，会直接抬高 TTFT 与 ITL 长尾；配合「KV 缓存使用率」一起看。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "reqps",
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 17
+      },
+      "id": 8,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "rate(vllm:num_preemptions_total[1m])",
+          "instant": false,
+          "range": true,
+          "legendFormat": "抢占 Preemptions/s",
+          "refId": "A"
+        }
+      ],
+      "title": "抢占次数速率",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prom"
+      },
+      "description": "每个 engine step（一次模型前向：prefill + decode，含投机解码的 draft/verify token）处理的 token 数分布，单位 tokens/engine-step。batch 越满该值越高；p99 远高于 p50 说明存在大 prefill 混插，是 ITL 毛刺的常见根因。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short",
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 25
+      },
+      "id": 9,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(vllm:iteration_tokens_total_bucket[1m])))",
+          "instant": false,
+          "range": true,
+          "legendFormat": "tokens/engine-step p50",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.9, sum by (le) (rate(vllm:iteration_tokens_total_bucket[1m])))",
+          "instant": false,
+          "range": true,
+          "legendFormat": "tokens/engine-step p90",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(vllm:iteration_tokens_total_bucket[1m])))",
+          "instant": false,
+          "range": true,
+          "legendFormat": "tokens/engine-step p99",
+          "refId": "C"
+        }
+      ],
+      "title": "每 step 处理 token 数",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prom"
+      },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 33
+      },
+      "id": 10,
+      "panels": [],
+      "title": "③ KV 缓存与前缀缓存",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prom"
+      },
+      "description": "GPU KV cache 占用率（%）。原始指标 vllm:kv_cache_usage_perc 是 0~1 的比例，此处查询里 * 100 转成百分比。长期 > 0.9 时通常开始出现抢占与排队。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percent",
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 34
+      },
+      "id": 11,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "vllm:kv_cache_usage_perc * 100",
+          "instant": false,
+          "range": true,
+          "legendFormat": "KV 缓存使用率 %",
+          "refId": "A"
+        }
+      ],
+      "title": "KV 缓存使用率",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prom"
+      },
+      "description": "prefix caching 命中率（%）：命中 token 占查询 token 的比例，越高说明多轮对话/共享 system prompt 复用越好，Prefill 开销越低。需要启动时开启前缀缓存 --enable-prefix-caching（本部署已开启）。分母用 clamp_min(...,1) 只是为防止除零。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percent",
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 34
+      },
+      "id": 12,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "rate(vllm:prefix_cache_hits_total[1m]) / clamp_min(rate(vllm:prefix_cache_queries_total[1m]), 1) * 100",
+          "instant": false,
+          "range": true,
+          "legendFormat": "前缀缓存命中率 %",
+          "refId": "A"
+        }
+      ],
+      "title": "前缀缓存命中率",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prom"
+      },
+      "description": "每秒由前缀缓存直接复用（无需重新计算）的 prompt token 数。与 prompt token 总吞吐对比，可量化 prefix caching 省下的 Prefill 算力。需要启动时开启 --enable-prefix-caching（本部署已开启）。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short",
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 34
+      },
+      "id": 13,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "rate(vllm:prompt_tokens_cached_total[1m])",
+          "instant": false,
+          "range": true,
+          "legendFormat": "已缓存 prompt token/s",
+          "refId": "A"
+        }
+      ],
+      "title": "已缓存 prompt token 速率",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prom"
+      },
+      "description": "KV cache block 的三条时间线（秒，p50）：lifetime = block 从分配到回收的总存活时间；idle_before_evict = 最后一次被使用到被驱逐的空闲时间；reuse_gap = 同一 block 两次复用之间的间隔。reuse_gap 越小、idle 越大，说明 block 复用充分。⚠️ 这三个直方图默认不导出，必须在 vLLM 启动参数里加 --kv-cache-metrics，否则本面板为空（同时会带来一定指标开销）。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s",
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 42
+      },
+      "id": 14,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(vllm:kv_block_lifetime_seconds_bucket[1m])))",
+          "instant": false,
+          "range": true,
+          "legendFormat": "KV block 生命周期 p50",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(vllm:kv_block_idle_before_evict_seconds_bucket[1m])))",
+          "instant": false,
+          "range": true,
+          "legendFormat": "KV block 驱逐前空闲 p50",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(vllm:kv_block_reuse_gap_seconds_bucket[1m])))",
+          "instant": false,
+          "range": true,
+          "legendFormat": "KV block 复用间隔 p50",
+          "refId": "C"
+        }
+      ],
+      "title": "KV block 生命周期/空闲/复用间隔 p50",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prom"
+      },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 50
+      },
+      "id": 15,
+      "panels": [],
+      "title": "④ 吞吐与算力利用率",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prom"
+      },
+      "description": "引擎每秒处理的 prompt（prefill）token 与 generation（decode）token 数，衡量整体吞吐。曲线掉头通常先于延迟劣化出现。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short",
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 51
+      },
+      "id": 16,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "rate(vllm:prompt_tokens_total[1m])",
+          "instant": false,
+          "range": true,
+          "legendFormat": "prompt token/s",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "rate(vllm:generation_tokens_total[1m])",
+          "instant": false,
+          "range": true,
+          "legendFormat": "generation token/s",
+          "refId": "B"
+        }
+      ],
+      "title": "prompt / generation token 吞吐",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prom"
+      },
+      "description": "按结束原因拆分的完成请求速率。正常只有 stop / length（以及投机解码下的其它正常终止原因）；出现 abort / error 类原因说明客户端取消或引擎异常。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "reqps",
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 51
+      },
+      "id": 17,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "sum by (finished_reason) (rate(vllm:request_success_total[1m]))",
+          "instant": false,
+          "range": true,
+          "legendFormat": "{{finished_reason}}",
+          "refId": "A"
+        }
+      ],
+      "title": "请求成功率",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prom"
+      },
+      "description": "按 GPU 折算的等效算力与显存带宽（含 KV/权重读写估算）。需要启动参数 --enable-mfu-metrics，否则 vllm:estimated_* 指标不存在、面板为空。原始指标是 FLOP/s 与 B/s 的速率，查询里 /1e12 与 /1e9 分别换算为 TF/s 与 GB/s。MFU 明显偏低时优先看「每 step 处理 token 数」是否偏小。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short",
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 51
+      },
+      "id": 18,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "rate(vllm:estimated_flops_per_gpu_total[1m]) / 1e12",
+          "instant": false,
+          "range": true,
+          "legendFormat": "TF/s per GPU",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "rate(vllm:estimated_read_bytes_per_gpu_total[1m]) / 1e9",
+          "instant": false,
+          "range": true,
+          "legendFormat": "GB/s per GPU（读 read）",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "rate(vllm:estimated_write_bytes_per_gpu_total[1m]) / 1e9",
+          "instant": false,
+          "range": true,
+          "legendFormat": "GB/s per GPU（写 write）",
+          "refId": "C"
+        }
+      ],
+      "title": "MFU 等效算力 / 带宽",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prom"
+      },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 59
+      },
+      "id": 19,
+      "panels": [],
+      "title": "⑤ 投机解码（草稿模型 / MTP）",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prom"
+      },
+      "description": "投机解码每秒的草稿 token 数、被验证接受的 token 数、以及草稿轮次（drafts）。需要启动时配置投机解码（--speculative-config / --speculative-model 等），否则指标不存在。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short",
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 60
+      },
+      "id": 20,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "rate(vllm:spec_decode_num_draft_tokens_total[1m])",
+          "instant": false,
+          "range": true,
+          "legendFormat": "草稿 draft token/s",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "rate(vllm:spec_decode_num_accepted_tokens_total[1m])",
+          "instant": false,
+          "range": true,
+          "legendFormat": "接受 accepted token/s",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "rate(vllm:spec_decode_num_drafts_total[1m])",
+          "instant": false,
+          "range": true,
+          "legendFormat": "草稿轮次 drafts/s",
+          "refId": "C"
+        }
+      ],
+      "title": "draft / accepted token 速率",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prom"
+      },
+      "description": "每个草稿轮次平均被接受的 token 数（+1 表示把被验证的原始 token 也算进接受长度），是投机解码收益的核心指标：接近 1 说明草稿几乎全被拒绝、收益为负，应调整草稿模型/草稿长度。需要启动时配置投机解码（--speculative-config 等）。分母 clamp_min(...,1) 仅用于防止除零；若要严格看「接受数/草稿数」比值，可把分母换成 rate(vllm:spec_decode_num_drafts_total[1m])。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short",
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 60
+      },
+      "id": 21,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "rate(vllm:spec_decode_num_accepted_tokens_total[1m]) / clamp_min(rate(vllm:spec_decode_num_drafts_total[1m]), 1) + 1",
+          "instant": false,
+          "range": true,
+          "legendFormat": "平均接受长度 (tokens/draft)",
+          "refId": "A"
+        }
+      ],
+      "title": "平均接受长度",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prom"
+      },
+      "description": "按草稿位置（position 标签，从 0 开始）拆分的接受 token 速率。曲线在第 k 个位置断崖式下降，说明草稿长度设置过长、后面位置的草稿基本被拒绝，可据此缩短 num_speculative_tokens。需要启动时配置投机解码（--speculative-config 等）。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short",
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 60
+      },
+      "id": 22,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "rate(vllm:spec_decode_num_accepted_tokens_per_pos_total[1m])",
+          "instant": false,
+          "range": true,
+          "legendFormat": "pos {{position}}",
+          "refId": "A"
+        }
+      ],
+      "title": "按草稿位置的接受数",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prom"
+      },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 68
+      },
+      "id": 23,
+      "panels": [],
+      "title": "⑥ 配置信息",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prom"
+      },
+      "description": "instant 查询，展示运行中引擎上报的 cache 配置（block size、num_gpu_blocks、prefix caching 开关与算法等），用来确认「我看到的命中率/占用率」到底跑在什么配置下。前缀缓存相关条目需要启动参数 --enable-prefix-caching（本部署已开启）才有意义。本面板是 Instant（表格）查询，其余面板均为 Range 查询。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 69
+      },
+      "id": 24,
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prom"
+          },
+          "editorMode": "code",
+          "expr": "vllm:cache_config_info",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "legendFormat": "cache_config",
+          "refId": "A"
+        }
+      ],
+      "title": "vllm:cache_config_info（运行中引擎的缓存/前缀缓存配置）",
+      "type": "table",
+      "sortOrder": null
+    }
+  ],
+  "preload": false,
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": [
+    "vllm",
+    "inference"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "vLLM 推理全流程观测",
+  "uid": "vllm-steps",
+  "version": 1,
+  "weekStart": ""
+}

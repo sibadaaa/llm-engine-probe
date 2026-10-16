@@ -1,0 +1,60 @@
+# docker-compose 基础文件（厂商中立）：只定义「容器壳」的通用部分。
+#
+# 定位：scripts/start_vllm.sh 是启动 vLLM 的主路径（它负责拼装全部观测开关与
+#       厂商设备直通、并支持 VENDOR=auto 自动探测）；
+#       compose 适合两种场景：
+#         1) 想用 compose 管理容器生命周期与观测栈（配 docker-compose.obs.yml）；
+#         2) 想给已有工作流一个声明式的容器定义。
+#
+# 多厂商：设备直通/环境注入在**厂商 overlay** 里，按需叠加：
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.hygon.yml up -d vllm
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.nvidia.yml up -d vllm
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.amd.yml up -d vllm
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.intel.yml up -d vllm
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.ascend.yml up -d vllm
+#
+# 然后（任一 overlay 方式）用 start_vllm.sh 复用该壳拉起 vLLM：
+#   EXEC_CONTAINER=vllm-probe-c scripts/start_vllm.sh --exec
+#
+# 端口约定：宿主机 ${PORT} → 容器内 ${INTERNAL_PORT}（compose 场景固定用 8000，
+# 这样 Prometheus 可以直接写死 target `vllm:8000`）。
+#
+# 自定义挂载（模型盘/源码目录）用同目录的 docker-compose.override.yml，
+# 或直接在自己的 overlay 里追加 volumes。
+
+services:
+  vllm:
+    image: ${IMAGE:?请在 .env 里设置 IMAGE 或使用厂商 overlay 指定镜像}
+    container_name: ${COMPOSE_CONTAINER:-vllm-probe-c}
+    security_opt:
+      - label=disable
+    # py-spy 需要 ptrace 权限
+    cap_add:
+      - SYS_PTRACE
+    ipc: host
+    shm_size: ${SHM_SIZE:-16g}
+    ports:
+      - "${PORT:-8100}:${INTERNAL_PORT:-8000}"
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    volumes:
+      - ../:/opt/vllm-probe:ro
+      - ${RUNS_DIR:-../runs}:/logs
+    environment:
+      VLLM_LOGGING_LEVEL: ${VLLM_LOGGING_LEVEL:-INFO}
+      VLLM_LOG_STATS_INTERVAL: ${LOG_STATS_INTERVAL:-5}
+      VLLM_LOG_BATCHSIZE_INTERVAL: ${LOG_BATCHSIZE_INTERVAL:-100}
+      VLLM_WORKER_MULTIPROC_METHOD: spawn
+      TOKENIZERS_PARALLELISM: "false"
+      PYTHONUNBUFFERED: "1"
+    # 默认只挂一个常驻壳；vLLM 进程由 scripts/start_vllm.sh --exec 或
+    # docker exec 拉起（与现网 z100-vllm 的运行方式一致，便于反复开关服务）
+    command: ["bash", "-lc", "sleep infinity"]
+    restart: unless-stopped
+    networks:
+      - probe-net
+
+networks:
+  probe-net:
+    name: vllm-probe-net

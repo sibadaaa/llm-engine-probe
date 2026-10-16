@@ -1,0 +1,23 @@
+# ============================================================================
+# Grafana 数据源自动装配（provisioning）
+# 挂载点：./configs/grafana/provisioning -> /etc/grafana/provisioning
+# 对应 overlay 里的 prometheus 服务（容器名 prometheus，容器内 9090）。
+# ============================================================================
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    # 容器间通过 compose 网络 probe-net 解析服务名，不要写 localhost。
+    url: http://prometheus:9090
+    isDefault: true
+    # 固定 uid：dashboards/vllm-inference-steps.json 中所有 panel 都写死了
+    # {"type":"prometheus","uid":"vllm-prom"}，改这里必须同步改 JSON。
+    uid: vllm-prom
+    # 禁止在 UI 里被误改（需要改时请改本文件并重启 grafana）。
+    editable: false
+    jsonData:
+      # 与 prometheus.yml 的 scrape_interval 保持一致，避免 rate() 取到空点。
+      timeInterval: 5s
+      httpMethod: POST

@@ -1,0 +1,62 @@
+# ============================================================================
+# Prometheus 配置 — vllm-docker-probe 可选观测栈
+#
+# 目标：抓取 vLLM 服务（任意厂商：NVIDIA/AMD/Hygon/Intel/Ascend）暴露的 /metrics。
+#
+# 注意：容器内 vLLM 始终监听 8000 端口（base compose 里映射为宿主
+#       ${PORT:-8100}:8000），因此抓取目标固定为 vllm:8000，与宿主端口无关。
+#
+# 校验：docker compose -f docker/docker-compose.yml \
+#                      -f docker/docker-compose.obs.yml --profile obs up -d
+#       热加载：curl -X POST http://localhost:${PROM_PORT:-9090}/-/reload
+# ============================================================================
+
+global:
+  # 5s 抓取一次：vLLM 的延迟/队列指标变化快，5s 才能看清 P/D 阶段抖动。
+  scrape_interval: 5s
+  evaluation_interval: 5s
+  scrape_timeout: 5s
+
+scrape_configs:
+  # --------------------------------------------------------------------------
+  # vLLM 引擎指标（/metrics，Prometheus text exposition format）
+  # --------------------------------------------------------------------------
+  - job_name: vllm
+    # vLLM 自身已经带了很有信息量的标签（model_name / finished_reason /
+    # reason / position 等），honor_labels 保证抓取时不被 target 标签覆盖。
+    honor_labels: true
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets:
+          - vllm:8000
+        labels:
+          service: vllm
+          model: qwen3.8-27b
+          engine: vllm-0.18.x
+
+    # ------------------------------------------------------------------------
+    # 【可选】降低抓取/存储量：丢弃无用的 Python 运行时与高基数 HTTP 直方图。
+    # 默认保持注释状态（即不改变默认行为）。整套默认指标约几百个 series，
+    # 只有在大 batch 压测 + 长时间保留时才需要打开。
+    #
+    # ⚠️ 打开前请注意：下面这条会一并丢掉 http_request_duration_highr_seconds_*，
+    #    而 Grafana 面板「HTTP 端到端延迟」正是用这个直方图，打开后该面板会空白。
+    #    如需保留该面板，请去掉正则中的 http_request_duration_highr_seconds.*
+    # ------------------------------------------------------------------------
+    # metric_relabel_configs:
+    #   - source_labels: [__name__]
+    #     regex: 'python_gc_.*|python_info|process_.*|vllm:cache_config_info|http_request_duration_highr_seconds.*'
+    #     action: drop
+
+  # --------------------------------------------------------------------------
+  # Prometheus 自身（抓取健康度 / TSDB 状态）
+  # --------------------------------------------------------------------------
+  - job_name: prometheus
+    honor_labels: true
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - localhost:9090
+        labels:
+          service: prometheus

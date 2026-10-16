@@ -1,0 +1,31 @@
+# 厂商 overlay：Huawei Ascend NPU（vllm-ascend）
+#
+# 前置条件：宿主机已安装 Ascend 驱动（/dev/davinci*、/usr/local/Ascend 等）。
+# 设备数量随机器不同，`devices:` 列表在 compose 里无法用通配符，因此这里按
+# davinci0..davinci7 列全（不存在且未映射时会报错，请按实际机器裁剪）。
+#
+# 用法（项目根目录）：
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.ascend.yml up -d vllm
+#   EXEC_CONTAINER=vllm-probe-c scripts/start_vllm.sh --exec
+
+services:
+  vllm:
+    devices:
+      - /dev/davinci0:/dev/davinci0
+      - /dev/davinci1:/dev/davinci1
+      - /dev/davinci2:/dev/davinci2
+      - /dev/davinci3:/dev/davinci3
+      - /dev/davinci4:/dev/davinci4
+      - /dev/davinci5:/dev/davinci5
+      - /dev/davinci6:/dev/davinci6
+      - /dev/davinci7:/dev/davinci7
+      - /dev/davinci_manager:/dev/davinci_manager
+      - /dev/devmm_svm:/dev/devmm_svm
+      - /dev/hisi_hdc:/dev/hisi_hdc
+    volumes:
+      - /usr/local/dcmi:/usr/local/dcmi:ro
+      - /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro
+      - /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro
+    environment:
+      ASCEND_RT_VISIBLE_DEVICES: ${VISIBLE_DEVICES:-0}
+      PYTHONPATH: ${PYTHONPATH_IN_CONTAINER:-/opt/vllm-probe}
