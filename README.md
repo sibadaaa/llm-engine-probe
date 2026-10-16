@@ -11,16 +11,16 @@
 | 项目 | 值 |
 |---|---|
 | 加速卡 | Hygon DCU Z100 / Z100L（DTK 26.04，ROCm 系）；其余四家为结构适配，见 §4b |
-| vLLM | `0.18.1+das.3266200.dtk2604`（源码 checkout：`/home/lyh/z100-vllm`，容器内挂到 `/src`） |
+| vLLM | `0.18.1+das.3266200.dtk2604`（源码 checkout：`https://github.com/sibadaaa/z100-vllm`，容器内挂到 `/src`） |
 | 现网模型 | `qwen3.8-27b`（FP8/INT8 + DFlash2 投机解码 k=7，TP=4，`--enforce-eager`） |
-| 容器配方 | 由厂商 profile 生成（hygon：`/dev/kfd /dev/mkfd /dev/dri` + video 组 + `/opt/hyhal`），镜像 `z100-s9-snap-s14` |
+| 容器配方 | 由厂商 profile 生成（hygon：`/dev/kfd /dev/mkfd /dev/dri` + video 组 + `/opt/hyhal`），镜像 `z100-s9-snap-s14`(本地镜像) |
 
 ---
 
 ## 1. 快速开始（三步）
 
 ```bash
-cd /home/lyh/vllm-test/vllm-docker-probe
+cd /vllm-docker-probe
 
 # ① 复制配置模板，按需修改（重点是 VENDOR / PORT / MODEL / PROBE_LEVEL）
 cp .env.example .env
