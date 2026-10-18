@@ -198,14 +198,40 @@ def _smi_hint(art: Artifacts) -> str:
     return "GPU SMI"
 
 
+def _runtime_label(meta: dict) -> str:
+    """运行方式：docker 容器 / 物理机（host）。旧 run_meta 没有 runtime 时按 docker 处理。"""
+    return "物理机（host）" if str(meta.get("runtime") or "docker").lower() == "host" else "容器（docker）"
+
+
+def _runtime_rows(meta: dict) -> list[list[object]]:
+    """概览里的运行方式相关行：host 展示宿主环境，docker 展示镜像/容器。"""
+    if str(meta.get("runtime") or "docker").lower() == "host":
+        host = meta.get("host") or {}
+        host_knl = " / ".join(
+            part for part in (str(host.get("hostname") or ""), str(host.get("kernel") or "")) if part
+        )
+        return [
+            ["运行方式", _runtime_label(meta)],
+            ["Host Python", host.get("python") or "—"],
+            ["宿主 Python 版本", host.get("python_version") or "—"],
+            ["宿主 vLLM", host.get("vllm_version") or "—"],
+            ["宿主 Torch", host.get("torch_version") or "—"],
+            ["主机 / 内核", host_knl or "—"],
+        ]
+    return [
+        ["运行方式", _runtime_label(meta)],
+        ["镜像", meta.get("image") or "—"],
+        ["容器", meta.get("container") or "—"],
+    ]
+
+
 def _section_overview(art: Artifacts) -> str:
     meta = art.meta
     rows = [
         ["运行目录", str(art.run_dir)],
         ["时间", meta.get("started_at", "—")],
         ["厂商", _vendor_label(art) + (f"（{_artifact_vendor(art)}）" if _artifact_vendor(art) else "")],
-        ["镜像", meta.get("image", "—")],
-        ["容器", meta.get("container", "—")],
+        *_runtime_rows(meta),
         ["模型", meta.get("model", "—")],
         ["服务名", meta.get("served_name", "—")],
         ["端口", meta.get("port", "—")],
@@ -1262,13 +1288,18 @@ def _section_artifacts(art: Artifacts) -> str:
         if path.is_file():
             rows.append([f"`{path.name}`", fmt(path.stat().st_size / 1024.0, 1, " KiB")])
     lines.append(table(["文件", "大小"], rows))
+    is_host = str(art.meta.get("runtime") or "docker").lower() == "host"
+    prelude = "# 物理机（host）模式：可先跑环境体检\nmake -C vllm-docker-probe host-check\n" if is_host else ""
+    runtime_var = "RUNTIME=host " if is_host else ""
     lines.append(
         "\n复现命令（在项目根目录执行）：\n\n```bash\n"
-        "make -C vllm-docker-probe probe RUN_DIR=" + str(art.run_dir) + "\n```\n"
+        + prelude
+        + "make -C vllm-docker-probe " + runtime_var + "probe RUN_DIR=" + str(art.run_dir) + "\n```\n"
     )
     cmd = art.meta.get("command")
     if cmd:
-        lines.append("\n本次启动命令：\n\n```bash\n" + str(cmd) + "\n```\n")
+        label = "本次启动命令（物理机直接启动）" if is_host else "本次启动命令"
+        lines.append("\n" + label + "：\n\n```bash\n" + str(cmd) + "\n```\n")
     return "\n".join(lines)
 
 

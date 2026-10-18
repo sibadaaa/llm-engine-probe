@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# 一眼看清当前探测实例的状态：容器、端点、关键指标、最近一次运行目录。
+# 一眼看清当前探测实例的状态：运行方式、端点、关键指标、最近一次运行目录。
 #
-# 用法：scripts/status.sh [--port 8100] [--run-dir DIR]
+# 用法：scripts/status.sh [--port 8100] [--run-dir DIR] [--runtime docker|host]
+#   RUNTIME=host scripts/status.sh    # 物理机（裸机）模式：显示宿主机上的 vLLM 进程
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,29 +13,64 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --port) PORT="${2:?}"; shift 2 ;;
     --run-dir) RUN_DIR="${2:?}"; shift 2 ;;
-    -h|--help) sed -n '2,5p' "$0"; exit 0 ;;
+    --runtime)
+      # runtime_normalize 只打印规范化结果（container→docker、bare/native→host），非法值 die
+      RUNTIME="$(runtime_normalize "${2:?}")"
+      export RUNTIME
+      shift 2
+      ;;
+    -h|--help) sed -n '2,6p' "$0"; exit 0 ;;
     *) die "未知参数：$1" ;;
   esac
 done
 
 BASE="http://127.0.0.1:$PORT"
 
-echo "===================== 容器 ====================="
+echo "===================== 运行方式 ====================="
+echo "运行时：$RUNTIME"
 echo "厂商：$VENDOR（$VENDOR_LABEL）  SMI：${VENDOR_SMI_CMD:-无}"
-if container_exists "$CONTAINER"; then
-  docker ps -a --filter "name=^/${CONTAINER}$" \
-    --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
-else
-  echo "（容器 $CONTAINER 不存在；MODE=${MODE}）"
+# 实例概况交给 common.sh 的 instance_describe（一行描述，有存活实例返回 0）；
+# 拿不到实例时给一句人类可读的提示，不要让脚本崩掉。
+DESCRIBE_RC=0
+instance_describe || DESCRIBE_RC=$?
+echo  # instance_describe 用 printf 输出、不带换行
+if (( DESCRIBE_RC != 0 )) && runtime_is_host; then
+  # docker 模式下 instance_describe 已经说明了容器状态，这里只给 host 模式补充启动指引
+  echo "（宿主机没有正在运行的 vLLM 实例；先执行 scripts/start_vllm.sh --host）"
+fi
+if runtime_is_host; then
+  HOST_PY="$(host_python 2>/dev/null || echo python3)"
+  echo "  HOST_PYTHON：$HOST_PY"
+  echo "  vLLM 版本：$("$HOST_PY" -c 'import vllm; print(vllm.__version__)' 2>/dev/null || echo '未知（当前 HOST_PYTHON 环境里 import vllm 失败）')"
+  # 进程表（pid/etime/args）：优先看 start_vllm.sh --host 记录的本实例（serve.pid），
+  # 没有本工具启动的实例时，只读地列出宿主机上按 pattern 能匹配到的 vLLM 进程（诊断用）。
+  if host_instance_running 2>/dev/null; then
+    INSTANCE_PID="$(host_instance_pid 2>/dev/null || true)"
+    echo "  --- 本实例进程（serve.pid） ---"
+    printf '  %-9s %-10s %s\n' "PID" "ELAPSED" "ARGS"
+    ps -o pid=,etime=,args= -p "$INSTANCE_PID" 2>/dev/null | cut -c1-200 | sed 's/^[[:space:]]*/  /' || true
+  else
+    HOST_VLLM_PIDS="$(host_vllm_pids 2>/dev/null || true)"
+    if [[ -n "$HOST_VLLM_PIDS" ]]; then
+      echo "  --- 宿主机上匹配 vLLM 的进程（pgrep -f \"${HOST_VLLM_PATTERN:-…}\"） ---"
+      printf '  %-9s %-10s %s\n' "PID" "ELAPSED" "ARGS"
+      while IFS= read -r _pid; do
+        [[ -n "$_pid" ]] || continue
+        ps -o pid=,etime=,args= -p "$_pid" 2>/dev/null | cut -c1-200 | sed 's/^[[:space:]]*/  /' || true
+      done <<< "$HOST_VLLM_PIDS"
+    fi
+  fi
 fi
 
 echo
 echo "===================== 端点 ====================="
-printf '%-28s %s\n' "/health" "$(curl -s -o /dev/null -w '%{http_code}' -m 5 "$BASE/health" || echo 000)"
-printf '%-28s %s\n' "/v1/models" "$(curl -s -o /dev/null -w '%{http_code}' -m 5 "$BASE/v1/models" || echo 000)"
-printf '%-28s %s\n' "/metrics" "$(curl -s -o /dev/null -w '%{http_code}' -m 10 "$BASE/metrics" || echo 000)"
+# 注意：curl -w '%{http_code}' 在连接失败时自己就会输出 000，
+# 这里不能再 `|| echo 000`（会变成 000000），只用 `|| true` 防止 set -e 退出。
+printf '%-28s %s\n' "/health" "$(curl -s -o /dev/null -w '%{http_code}' -m 5 "$BASE/health" 2>/dev/null || true)"
+printf '%-28s %s\n' "/v1/models" "$(curl -s -o /dev/null -w '%{http_code}' -m 5 "$BASE/v1/models" 2>/dev/null || true)"
+printf '%-28s %s\n' "/metrics" "$(curl -s -o /dev/null -w '%{http_code}' -m 10 "$BASE/metrics" 2>/dev/null || true)"
 printf '%-28s %s\n' "/start_profile(profiler)" \
-  "$(curl -s -o /dev/null -w '%{http_code}' -m 5 -X POST "$BASE/start_profile" 2>/dev/null || echo 000)"
+  "$(curl -s -o /dev/null -w '%{http_code}' -m 5 -X POST "$BASE/start_profile" 2>/dev/null || true)"
 
 echo
 echo "===================== 关键指标 ====================="
@@ -71,8 +107,12 @@ fi
 
 echo
 echo "===================== 日志 ====================="
-LATEST="$(latest_run_dir 2>/dev/null || true)"
-if [[ -n "${LATEST:-}" && -f "$LATEST/serve.log" ]]; then
+# 注意：latest_run_dir 找不到目录时返回 1（不 die），放进 if 条件里优雅降级即可。
+LATEST=""
+if ! LATEST="$(latest_run_dir 2>/dev/null)"; then
+  LATEST=""
+fi
+if [[ -n "$LATEST" && -f "$LATEST/serve.log" ]]; then
   echo "  运行目录：$LATEST"
   echo "  日志行数：$(wc -l < "$LATEST/serve.log")"
   echo "  --- 最近 5 条 step/统计 ---"

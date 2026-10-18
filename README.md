@@ -2,6 +2,8 @@
 
 在 Docker 中启动一个**可观测的 vLLM 实例**，并把一次推理从「HTTP 请求 → 调度排队 → 预填充 → 解码 → 投机解码验证 → GPU kernel」的**每一步**都采出来，最后汇总成一份中文 Markdown 报告，直接告诉你下一步该优化什么。
 
+**双运行方式**：同一套探测/对比测试既支持 **Docker（默认）**，也支持**物理机（裸机）直接跑**（`RUNTIME=host`）。两种方式用的探针、套件、报告与产物字段完全一致，因此"容器内 vs 裸机"的结果可以直接并排对比；物理机模式只需要一个能 `import vllm` 的 Python 环境，不需要构建镜像（见 §1b 与 [`docs/物理机模式.md`](docs/物理机模式.md)）。
+
 **多厂商支持**：容器启动、设备直通、GPU 遥测（SMI）、算子归因规则、报告文案全部走厂商抽象层（`vendors/` ↔ `probe/vendors.py`）。内置 **NVIDIA / AMD / Hygon / Intel / Ascend** 五家适配，其他厂商按 `vendors/README.md` 的模板自行扩展；另有 `generic` 兜底用于 CI / 无 GPU 环境。
 
 **标准化对比**：`make suite` 跑固定 8 场景矩阵，产出稳定 schema 的 `suite_results.json`；`make compare A=… B=…` 跨厂商/跨机器并排对比。
@@ -49,12 +51,61 @@ make env        # 自检：哪些观测开关真的生效了
 
 ---
 
+## 1b. 物理机（裸机）模式：同样的测试，不依赖 Docker
+
+没有 Docker（或不想用 Docker）时，把同一套探测/对比测试**直接在物理机上跑**：
+探针、套件、报告、对比全部复用，只是"起实例/停实例/看状态"从容器换成宿主机进程。
+适合人群、前置条件（驱动/Python+vLLM/厂商环境脚本/ulimit 与 `/dev/shm`）、预检项、
+systemd 常驻与排错表见详细指南 [`docs/物理机模式.md`](docs/物理机模式.md)。
+
+```bash
+# ① 复制配置并切到物理机模式。HOST_PYTHON 指向已装好 vLLM 的解释器（venv/conda 均可）
+cp .env.example .env
+#   .env 里至少改三行：
+#   RUNTIME=host
+#   HOST_PYTHON=/path/to/venv/bin/python
+#   MODEL=/宿主机上的模型目录
+
+# ② 预检：Python/vLLM 导入、GPU 与驱动、厂商 prelude、模型/端口、系统限制
+make host-check
+
+# ③ 起实例（也可以 make up RUNTIME=host）
+make up-host
+
+# ④ 跑完全相同的探测与套件
+make probe-host          # 全链路 + REPORT.md
+make suite-host          # 标准化 8 场景 → suite_results.json
+
+# ⑤ 与 Docker 模式的结果并排对比（对比表会标明运行方式）
+make compare A=runs/<docker>/suite_results.json B=runs/<host>/suite_results.json
+```
+
+| 事项 | Docker 模式 | 物理机（host）模式 |
+|---|---|---|
+| 启动 | `make up`（内部 `docker run`） | `make up-host`（本机 `HOST_PYTHON` 起 vLLM CLI） |
+| 停止 | `make down` / `make down-rm` | `make down-host` |
+| 状态 | `make status` | `make status-host` |
+| 日志 | `docker logs -f vllm-probe` | `tail -f <RUN_DIR>/serve.log`（`make watch` 逐 step 解析） |
+| trace 目录 | 运行目录 `traces/`（容器内 `/traces`） | 同一路径 `<RUN_DIR>/traces`（宿主机上） |
+| py-spy | `make pyspy`（容器内采样） | `RUNTIME=host scripts/pyspy.sh`（本机 PID 采样） |
+| 前置条件 | Docker daemon + 镜像 + 设备直通 | 本机驱动 + 能 `import vllm` 的 Python 环境，且 `make host-check` 通过 |
+
+> 物理机模式**不需要**镜像、容器、`docker-compose` 观测栈，也**不需要改** `probe/` 工具包或 `vendors/` 适配层；
+> 设备可见性环境变量与厂商 prelude 仍然生效，只有 Docker 设备直通参数被忽略。
+
+> 🕒 **停止行为**：`make down-host` 停止后默认会轮询本机 SMI、等显存回落（最长约 60s，本机还有其它显存占用时可能等满）。
+> 同机还有其它任务、或只是调试假实例时，可用 `PROBE_SKIP_VRAM_WAIT=1 make down-host` 跳过（等价
+> `RUNTIME=host scripts/stop_vllm.sh --no-vram-wait`）。
+
+---
+
 ## 2. 目录结构
 
 ```
 vllm-docker-probe/
 ├── README.md                     ← 本文件（使用说明）
 ├── docs/观测字段对照表.md          ← 字段级参考：每一步有哪些指标/日志/事件
+├── docs/物理机模式.md              ← 物理机（裸机）模式详细指南（RUNTIME=host）
 ├── .env.example                  ← 全部可调参数（含多厂商示例块）
 ├── Makefile                      ← 快捷入口（make help）
 ├── vendors/                      ← 厂商适配层（Shell 端）：nvidia/amd/hygon/intel/ascend
@@ -83,12 +134,13 @@ vllm-docker-probe/
 │   └── vllm_probe_stat_logger/   ← records.py（纯标准库抽取）+ __init__.py（StatLoggerBase 子类）
 ├── scripts/
 │   ├── start_vllm.sh stop_vllm.sh wait_ready.sh status.sh
+│   ├── host_check.sh             ← 物理机环境预检（GPU/Python/vLLM/系统限制）
 │   ├── collect_metrics.sh probe_http.sh watch_steps.sh
 │   ├── trace_capture.sh pyspy.sh gpu_sample.sh run_suite.sh
 │   ├── probe_all.sh report.sh build_image.sh
-│   └── lib/common.sh             ← 配置 + 厂商检测 + docker 辅助
+│   └── lib/common.sh             ← 配置 + 厂商检测 + 运行时（docker/host）辅助
 ├── samples/                      ← 真实日志/指标/profiler/SMI 样例（测试用）
-├── tests/                        ← 单元测试 + mock 服务 + 端到端自测
+├── tests/                        ← 单元测试 + mock 服务 + 端到端自测 + host 模式自测
 └── runs/<时间戳>/                 ← 每次探测的全部产物（报告就在这）
 ```
 
@@ -160,6 +212,11 @@ make up-kernel
 
 探测顺序 `ascend → nvidia → hygon → amd → intel`，可用 `.env` 的 `VENDOR=` 显式覆盖（默认 `auto`）。
 
+> **物理机模式**（`RUNTIME=host`）下这一层同样生效：厂商 profile 生成的**设备可见性环境变量**
+> （`CUDA_VISIBLE_DEVICES` / `HIP_VISIBLE_DEVICES` / `ASCEND_RT_VISIBLE_DEVICES` / `ZE_AFFINITY_MASK`）和
+> **厂商 prelude 环境脚本**（DTK / `set_env.sh`）仍会注入到本机 vLLM 进程；只有 Docker 专属的
+> **设备直通参数**（`--device` / `--gpus` / `--group-add`）被忽略——设备可见性由宿主机驱动与用户权限决定。
+
 ### 每层的厂商适配点
 
 | 层 | Shell 端（`vendors/<id>.sh`） | Python 端（`probe/vendors.py`） |
@@ -184,6 +241,21 @@ make up-kernel
 
 ## 5. 命令速查
 
+### 运行方式：`RUNTIME=docker`（默认）| `host`
+
+所有脚本调用都可以用 `RUNTIME` 切换运行方式；Makefile 为物理机模式准备了 `*-host` 目标：
+
+```bash
+RUNTIME=host                          # 物理机（裸机）直接跑；不设则为 docker
+make up RUNTIME=host                  # 临时用 host 跑一次（等价 make up-host）
+make up-host                          # 推荐：物理机模式启动
+RUNTIME=host scripts/start_vllm.sh --host --level steps
+```
+
+> Makefile **不硬编码**运行方式：`.env` 里写 `RUNTIME=host` 后，`make up/down/status/probe/...`
+> 全部自动走物理机模式；只想临时切一次时用 `make up RUNTIME=host`，或直接用 `make up-host`
+> 等 `*-host` 目标（它们显式带 `--host`，不依赖 `.env`）。
+
 ### Makefile
 
 ```bash
@@ -191,6 +263,13 @@ make help        # 列出全部目标
 make vendor      # 厂商检测结果 / SMI 可用性 / trace 规则包
 make up          # 起可观测实例（LEVEL=steps，可覆盖：make up LEVEL=deep）
 make up-kernel   # kernel 档（profiler + 逐层 NVTX）
+make host-check  # 物理机环境预检（GPU 驱动/Python/vLLM/系统限制；JSON=1 输出 JSON）
+make up-host     # 物理机（裸机）直接启动，不依赖 Docker
+make down-host   # 停止物理机实例
+make status-host # 物理机实例状态（运行方式/PID/端点/指标/日志）
+make probe-host  # 物理机实例一键全链路 + 报告
+make suite-host  # 物理机实例标准化对比套件
+make trace-host  # 物理机实例抓 torch trace 并分析
 make down        # 停实例（保留容器与日志）
 make status      # 状态 + 关键指标
 make env         # 观测开关自检
@@ -201,10 +280,10 @@ make steps       # 只做 step 级摘要
 make watch       # 实时逐 step 观察
 make report      # 重新生成报告
 make suite       # 标准化对比套件（8 场景 → suite_results.json）
-make compare     # 对比两次套件结果：make compare A=… B=…（跨厂商）
+make compare     # 对比两次套件结果：make compare A=… B=…（跨厂商/跨运行方式）
 make gpu-sample  # 采样 GPU 遥测 60 秒（各厂商 SMI）
-make test        # 单元测试 + mock 端到端自测
-make obs-up      # 起 Prometheus + Grafana（可选观测栈）
+make test        # 单元测试 + mock 端到端 + host 模式自测
+make obs-up      # 起 Prometheus + Grafana（可选观测栈，仅 Docker 模式）
 make compose-up  # 用 compose 起容器壳（VENDOR 自动探测，可覆盖）
 ```
 
@@ -224,6 +303,13 @@ scripts/gpu_sample.sh --duration 60
 scripts/run_suite.sh [--scenarios s02,s05 | --list]
 scripts/probe_all.sh [--with-gpu-sample] [--with-pyspy] [--skip-trace]
 scripts/report.sh [--open]
+
+# 物理机模式（同样的脚本 + RUNTIME=host；start 也可用 --host）
+RUNTIME=host scripts/start_vllm.sh [--host] [--level steps|deep|kernel] [--dry-run] [--skip-check]
+RUNTIME=host scripts/stop_vllm.sh [--run-dir runs/<时间戳>]
+RUNTIME=host scripts/status.sh [--port 8100]
+RUNTIME=host scripts/pyspy.sh --mode dump|flame [--duration 30]
+bash scripts/host_check.sh [--json] [--quick] [--start]   # 物理机环境预检
 ```
 
 ### Python 工具包
@@ -394,6 +480,10 @@ GPU 时间分类占比（分母=叶子 GPU 事件，故相加约为 100%）:
 
 trace 文件保持原格式，可直接用 Chrome `chrome://tracing` 或 Perfetto 打开看完整时间线。
 
+> **物理机模式**：trace 同样落在 `<RUN_DIR>/traces/`（就是宿主机上运行目录里的 `traces/`，kernel 档的
+> profiler 输出目录就是这个路径），文件名/格式与 Docker 模式一致；`trace_capture.sh` 只依赖
+> `/start_profile`、`/stop_profile` 与端口，因此 `make trace-host` 即可，无需改任何分析代码。
+
 ### 6.5 CPU 侧与硬件：`scripts/pyspy.sh`、`scripts/gpu_sample.sh`
 
 ```bash
@@ -405,6 +495,10 @@ scripts/gpu_sample.sh --duration 60         # 显存/功耗/温度采样（厂�
 `gpu_sample.sh` 的 SMI 命令由厂商 profile 决定（hygon=hy-smi、nvidia=nvidia-smi、
 amd=amd-smi/rocm-smi、ascend=npu-smi、intel=xpu-smi），解析在
 `probe/telemetry.py` 中归一化成统一 JSONL（各卡 vram_perc/power_w/temp_c/util_perc）。
+
+> **物理机模式**：`RUNTIME=host scripts/pyspy.sh --mode dump|flame` 直接采样本机 PID，
+> 产物同样在 `<RUN_DIR>/pyspy/`（py-spy 可执行文件可用 `PYSPY_BIN` 指定，默认找 `PATH`）；
+> `gpu_sample.sh` 直接调用本机 SMI，产物 `<RUN_DIR>/gpu_telem.jsonl` 与 Docker 模式同 schema。
 
 用途：GPU 时间线出现空洞、或 step 时间进入"慢态"时，确认是 CPU 侧（调度/后处理/日志量）
 还是硬件侧（降频、显存换出）。注意部分平台的 SMI 不提供真实利用率
@@ -518,8 +612,10 @@ llm_engine step: get_output / process_outputs / record_stats / abort_requests
 
 | 文件 | 内容 |
 |---|---|
-| `run_meta.json` | 本次运行的镜像/模型/并行度/观测档位/完整启动命令 |
+| `run_meta.json` | 本次运行的运行方式（`runtime` 为 docker 或 host）/镜像或本机环境/模型/并行度/观测档位/完整启动命令；host 模式另有 `host` 段（python、python_version、vllm_version、torch_version、hostname、kernel） |
 | `cmd.txt`、`args.txt` | 可复现的命令行（直接拷贝即可重跑） |
+| `serve.pid`、`serve.pgid`（host） | 本机 vLLM 进程 PID / 进程组 ID（stop 时按组清理；Docker 模式无此文件） |
+| `serve_launch.sh`（host） | 实际执行的启动脚本（含厂商 prelude、环境变量与完整命令，可直接复现） |
 | `serve.log` | 引擎完整日志（逐 step 明细、stats、投机解码、MFU、图统计） |
 | `env_check.json` | 观测开关自检结果 |
 | `http_requests.jsonl` / `http_summary.json` | 逐请求明细 / 分位数汇总 |
@@ -543,6 +639,10 @@ make obs-up             # 起 prometheus(9090) + grafana(3000) + otel-collector(
 # 浏览器打开 http://127.0.0.1:3000 ，看板「vLLM 推理全流程观测」已自动导入
 make obs-down
 ```
+
+> **物理机模式不启动这套 compose 观测栈**（host 模式没有 Docker 文件层）：请在**外部 Prometheus**
+> 里直接抓宿主机 `:PORT/metrics`（如 `http://<宿主机IP>:8100/metrics`）；Grafana 看板与指标名、
+> 面板描述里标注的 vLLM 开关全部保持不变。
 
 看板按推理链路分成 6 组：请求生命周期（队列/预填充/解码/TTFT/ITL/TPOT 分位）、调度与队列
 （`num_requests_waiting_by_reason` 分解）、KV 与前缀缓存、吞吐与 MFU、投机解码接受率、配置信息。
@@ -647,6 +747,29 @@ make gpu-sample                 # 采样各卡 VRAM%（或直接用本机 SMI：
 `start_vllm.sh` 会把项目目录挂到容器 `/opt/vllm-probe` 并设置 `PYTHONPATH`，因此**容器内外都能直接跑**。
 `scripts/build_image.sh` 只是为了做一个"自带工具包"的镜像，便于分发。
 
+**Q11：机器上根本没有 Docker，这套工具还能用吗？**
+能。用**物理机（裸机）模式**：`.env` 里设 `RUNTIME=host`，`HOST_PYTHON` 指向已装好 vLLM 的解释器，
+然后 `make host-check` → `make up-host` → `make probe-host`。host 模式完全不调用 Docker，
+也不需要镜像/容器/compose 观测栈；探针（`probe/`）是纯标准库，`vendors/` 适配层照常生效。
+详见 [`docs/物理机模式.md`](docs/物理机模式.md) 与 §1b。
+
+**Q12：host 模式启动时报 `import vllm` / `import torch` 失败或版本不对？**
+先确认 `HOST_PYTHON` 指向的**就是**装了 vLLM 的那个解释器（venv/conda 常见错误是 `python3` 指到系统 Python）；
+再确认厂商环境已 source（hygon 的 DTK、Ascend 的 `set_env.sh`）——host 模式要把这些路径写进
+`HOST_PRELUDE_FILES`。`make host-check` 会逐项检查；实际版本记录在 `run_meta.json` 的 `host` 段，
+和 Docker 模式对比前请先对齐。
+
+**Q13：host 模式 py-spy 还是报权限错误？**
+容器模式靠 `--cap-add SYS_PTRACE`；物理机模式直接对本机 PID 采样，但 Linux 的 yama 限制仍可能拦截：
+`cat /proc/sys/kernel/yama/ptrace_scope`，临时放宽 `sudo sysctl -w kernel.yama.ptrace_scope=0`，
+或让进程/用户具备 `CAP_SYS_PTRACE`（systemd 常驻场景见文档里的 unit 示例）。
+py-spy 不在 `PATH` 时用 `.env` 的 `PYSPY_BIN` 指定。
+
+**Q14：host 模式端口被占用 / 多实例显存挤兑？**
+和 Docker 模式同一套约定：默认 `PORT=8100` 避开现网 8000；先 `make status-host` 看端点状态，
+`ss -ltnp | grep 8100` 找占用进程，或换 `PORT`。物理机上两个实例同时驻留同一组卡同样会互相挤兑显存，
+**一次只跑一个探测实例**，并用 `make gpu-sample`（或本机 SMI）确认显存已回落。
+
 ---
 
 ## 11. 已验证环境与自测
@@ -655,7 +778,7 @@ make gpu-sample                 # 采样各卡 VRAM%（或直接用本机 SMI：
 make test          # = bash tests/run_tests.sh
 ```
 
-自测包含三层，全部可在**无 GPU、无 Docker** 的机器上跑：
+自测包含四层，全部可在**无 GPU、无 Docker、未安装 vLLM** 的机器上跑：
 
 1. **单元测试**：真实日志样例（`samples/serve.log`）、真实 `/metrics` 抓取（`samples/metrics.txt`）、
    合成 Chrome trace、mock 服务下的请求级打点、报告生成与自动归因、
@@ -663,9 +786,14 @@ make test          # = bash tests/run_tests.sh
    插件记录抽取（鸭子类型假对象，验证"字段改名只丢该项、不抛异常"）、
    **厂商注册表一致性守卫**（Shell `vendors/*.sh` ↔ Python `probe/vendors.py`）、
    **五家 SMI 输出解析**（`samples/smi/` 样例文本）、标准化套件 schema。
-2. **脚本语法检查**：全部 `scripts/*.sh`、`vendors/*.sh` 过 `bash -n`。
+2. **脚本语法检查**：全部 `scripts/*.sh`、`vendors/*.sh` 与自测脚本过 `bash -n`。
 3. **mock 端到端**：起一个 mock vLLM（含 `/metrics`、SSE 流式、`/start_profile`），
    跑通 `env → vendor → metrics → http → telemetry → diff → trace_capture → logs → plugin → suite → compare → probe_all → REPORT.md` 全链路。
+4. **物理机（host）模式自测**（`tests/host_mode_selftest.sh`）：用临时模型 + 假入口
+   （`python3 -c 'import time;time.sleep(120)'`）校验 `RUNTIME=host` 的 `start --dry-run` 输出
+   （含 host/exec、不含 `docker run`）、真实起停（`serve.pid`/`serve.pgid`/`serve_launch.sh`/`cmd.txt`/`traces/`）、
+   `status` 显示「运行方式」、`host_check.sh --json` 产出 JSON（存在时）、
+   `watch_steps.sh --docker` 在 host 下明确拒绝。
 
 插件还有一层**只在容器内可跑**的自检（验证 entry point 能被 vLLM 加载器发现、
 字段与当前版本一致，见 §6.7 的命令）——本机已实测 18/18 项通过。
@@ -693,3 +821,10 @@ make test          # = bash tests/run_tests.sh
    （来自本项目历史结论，例如"图模式收益仅 ~0.5%"），厂商专属覆盖在
    `probe/vendors.py::VendorProfile.diagnose_overrides`；换模型/换卡后请同步调整。
 5. **日志量**：`steps` 档约 5 行/秒；长时间高频压测建议配合 `watch_steps.sh --tail` 做分段汇总。
+6. **host 与 Docker 的结果可比，但要控制变量**：两种运行方式用的是同一套探针与同一份产物 schema，
+   但对比时必须**同模型/同权重、同 vLLM/torch 版本、同启动参数、同 `PROBE_LEVEL` 档位、同负载**
+   （`kernel` 档会自动关图模式，不要拿它当吞吐基线）；`suite_results.json` / `run_meta.json` 与对比表
+   都会记录运行方式（`runtime`）与本机环境（`host.python/vllm_version/torch_version`），先核对再下结论。
+7. **物理机模式不要"跳过 Docker 那套限制"**：`--shm-size` / `--ulimit memlock` / `--ipc=host` 在 host 上
+   对应宿主机的 `/dev/shm` 与 `ulimit`，没配好会直接表现为启动失败或 TP 初始化卡住，见 §1b 与
+   [`docs/物理机模式.md`](docs/物理机模式.md) 的故障排查表。

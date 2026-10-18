@@ -30,6 +30,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# 物理机模式不使用镜像：给出明确指引，避免用户误以为要构建/拉取镜像。
+if runtime_is_host; then
+  die "物理机模式不需要镜像；直接 scripts/start_vllm.sh --host（先 scripts/host_check.sh 预检）"
+fi
+
 BASE_IMAGE="${BASE_IMAGE:-$IMAGE}"
 require_cmd docker
 [[ -f "$PROJECT_ROOT/docker/Dockerfile" ]] || die "找不到 docker/Dockerfile"

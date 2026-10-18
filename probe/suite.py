@@ -280,6 +280,10 @@ def _engine_context(cfg: ProbeConfig) -> dict[str, Any]:
             context["probe_level"] = meta.get("probe_level")
             context["command"] = meta.get("command")
             context["image"] = meta.get("image")
+            # 运行方式：docker（默认，兼容旧 run_meta）| host（物理机直接跑）
+            context["runtime"] = meta.get("runtime") or "docker"
+            if isinstance(meta.get("host"), dict):
+                context["host"] = meta["host"]
             if meta.get("vendor"):
                 context["vendor_in_meta"] = meta.get("vendor")
         except (json.JSONDecodeError, OSError):
@@ -400,14 +404,31 @@ def _fmt_value(value: Any, unit: str) -> str:
     return str(value)
 
 
+def _runtime_desc(payload: dict[str, Any]) -> str:
+    """套件结果里的运行方式描述（跨 Docker / 物理机对比时一眼看出差异）。"""
+    engine = payload.get("engine") or {}
+    if str(engine.get("runtime") or "docker").lower() == "host":
+        host = engine.get("host") or {}
+        parts = [
+            str(part)
+            for part in (host.get("hostname"), host.get("python_version") or host.get("python"))
+            if part
+        ]
+        return "物理机（host）" + (f" · {' / '.join(parts)}" if parts else "")
+    image = engine.get("image") or ""
+    return "容器（docker）" + (f" · {image}" if image else "")
+
+
 def compare_payloads(a: dict[str, Any], b: dict[str, Any]) -> str:
     """两份 suite_results → 并排 Markdown 对比表。"""
     lines = ["# 标准化套件对比（A vs B）\n"]
     header = [
         ["A", f"{a.get('vendor', {}).get('label', '?')} · {_dig(a, ('engine', 'model')) or '?'}"],
         ["A 运行", str(a.get("created_at", "—"))],
+        ["A 运行方式", _runtime_desc(a)],
         ["B", f"{b.get('vendor', {}).get('label', '?')} · {_dig(b, ('engine', 'model')) or '?'}"],
         ["B 运行", str(b.get("created_at", "—"))],
+        ["B 运行方式", _runtime_desc(b)],
         ["A 硬件", ", ".join((a.get("hardware") or {}).get("cards") or []) or "—"],
         ["B 硬件", ", ".join((b.get("hardware") or {}).get("cards") or []) or "—"],
     ]

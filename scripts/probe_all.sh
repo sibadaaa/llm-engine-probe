@@ -41,22 +41,39 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-RUN_DIR="$(latest_run_dir 2>/dev/null || new_run_dir probe)"
+# latest_run_dir 找不到目录时返回 1（不 die），据此回落去新建一个运行目录
+if ! RUN_DIR="$(latest_run_dir 2>/dev/null)"; then
+  RUN_DIR="$(new_run_dir probe)"
+fi
 mkdir -p "$RUN_DIR"
 
 # 如果是直接对"已在运行的实例"做探测（没经过 start_vllm.sh），补一份最小 run_meta.json，
 # 这样报告的开头不会是一片"—"。
 if [[ ! -f "$RUN_DIR/run_meta.json" ]]; then
-  RUN_META_DIR="$RUN_DIR" PORT="$PORT" PROBE_LEVEL="$PROBE_LEVEL" py - <<'PY'
+  RUNTIME_VALUE="${RUNTIME:-docker}"
+  HOST_PYTHON_VALUE=""
+  if runtime_is_host; then
+    HOST_PYTHON_VALUE="$(host_python 2>/dev/null || echo python3)"
+  fi
+  RUN_META_DIR="$RUN_DIR" PORT="$PORT" PROBE_LEVEL="$PROBE_LEVEL" \
+  RUNTIME_VALUE="$RUNTIME_VALUE" HOST_PYTHON_VALUE="$HOST_PYTHON_VALUE" py - <<'PY'
 import json, os, time
+runtime = os.environ.get("RUNTIME_VALUE") or "docker"
 meta = {
     "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-    "container": os.environ.get("CONTAINER", ""),
-    "image": os.environ.get("IMAGE", ""),
+    "runtime": runtime,
+    # host 模式没有容器/镜像，保持与 start_vllm.sh 的 run_meta 契约一致
+    "container": "" if runtime == "host" else os.environ.get("CONTAINER", ""),
+    "image": "" if runtime == "host" else os.environ.get("IMAGE", ""),
     "port": int(os.environ["PORT"]),
     "probe_level": os.environ.get("PROBE_LEVEL", ""),
     "note": "由 probe_all.sh 生成（未经过 start_vllm.sh，模型/参数等字段请以实际进程为准）",
 }
+if runtime == "host":
+    host_python = os.environ.get("HOST_PYTHON_VALUE", "")
+    # host_python 供人读；"host" 字典与 report/suite 的 run_meta 契约保持一致
+    meta["host_python"] = host_python
+    meta["host"] = {"python": host_python}
 path = os.path.join(os.environ["RUN_META_DIR"], "run_meta.json")
 open(path, "w").write(json.dumps(meta, ensure_ascii=False, indent=2))
 PY
@@ -117,7 +134,7 @@ else
       --jsonl "$RUN_DIR/steps.jsonl" --summary "$RUN_DIR/steps_summary.json" \
       || warn "日志解析失败（可能没有 iteration 明细；档位需 >= steps）"
   else
-    warn "找不到 $RUN_DIR/serve.log；若用 docker logs 收集，请先落盘日志"
+    warn "日志未落盘：docker 模式请确认 /logs 挂载；host 模式确认 start_vllm.sh 已写 serve.log（本次跳过 step 级解析）"
   fi
 fi
 
@@ -131,7 +148,7 @@ if [[ -n "$PLUGIN_JSONL" ]]; then
   [[ "$PLUGIN_JSONL" == "$RUN_DIR/probe_steps.jsonl" ]] || cp -f "$PLUGIN_JSONL" "$RUN_DIR/probe_steps.jsonl"
   py -m probe plugin --outdir "$RUN_DIR" --file "$RUN_DIR/probe_steps.jsonl" || warn "插件数据解析失败"
 elif [[ "${PROBE_PLUGIN:-0}" == "1" ]]; then
-  warn "PROBE_PLUGIN=1 但找不到 probe_steps.jsonl（应写在 /logs/probe_steps.jsonl）"
+  warn "PROBE_PLUGIN=1 但找不到 probe_steps.jsonl（docker 模式应写在 /logs/probe_steps.jsonl；host 模式应写在 $RUN_DIR/probe_steps.jsonl）"
 fi
 
 # 5) 算子级（torch profiler）

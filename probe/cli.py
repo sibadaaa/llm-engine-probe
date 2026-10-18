@@ -13,6 +13,7 @@
     suite    标准化对比测试套件（固定场景矩阵 → 可跨厂商对比的 JSON）
     compare  并排对比两份 suite 结果
     report   把一次运行目录里的所有产物合成中文 Markdown 报告
+    hostcheck 物理机（host）模式环境预检：起 vLLM 前先看缺什么
 
 所有子命令都可用 ``--outdir`` 指定产物目录（默认取环境变量 ``PROBE_OUTDIR``，
 再默认 ``runs/latest``）。
@@ -612,6 +613,28 @@ def cmd_report(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
+# 子命令：hostcheck
+# --------------------------------------------------------------------------
+
+
+def cmd_hostcheck(args: argparse.Namespace) -> int:
+    from .hostcheck import run_hostcheck
+
+    return run_hostcheck(
+        host_python=args.host_python,
+        model=args.model,
+        port=args.port,
+        outdir=args.outdir,
+        prelude=args.prelude,
+        quick=args.quick,
+        start=args.start,
+        skip_vllm_import=args.skip_vllm_import,
+        skip_gpu=args.skip_gpu,
+        write_json_file=args.json,
+    )
+
+
+# --------------------------------------------------------------------------
 # 入口
 # --------------------------------------------------------------------------
 
@@ -737,6 +760,29 @@ def build_parser() -> argparse.ArgumentParser:
     p_compare.add_argument("--b", required=True, help="B 的 suite_results.json")
     p_compare.add_argument("--out", default=None, help="输出 Markdown 文件（默认打印）")
     p_compare.set_defaults(func=cmd_compare)
+
+    p_hostcheck = sub.add_parser("hostcheck", help="物理机（host）模式环境预检：起 vLLM 前体检缺什么")
+    p_hostcheck.add_argument("--json", action="store_true",
+                             help="额外写 <outdir>/host_check.json")
+    p_hostcheck.add_argument("--outdir", dest="outdir", default=None,
+                             help="产物目录（默认 $PROBE_OUTDIR 或 runs/latest）")
+    p_hostcheck.add_argument("--host-python", dest="host_python", default=None,
+                             help="宿主 Python 解释器（默认 $HOST_PYTHON 或 python3）")
+    p_hostcheck.add_argument("--model", default=None,
+                             help="模型目录（默认 $MODEL）")
+    p_hostcheck.add_argument("--port", type=int, default=None,
+                             help="服务端口（默认 $PORT 或 8100）")
+    p_hostcheck.add_argument("--quick", action="store_true",
+                             help="跳过耗时项（import vllm/torch、GPU SMI 采样）")
+    p_hostcheck.add_argument("--start", action="store_true",
+                             help="启动前快速预检：只跑 fail 级核心项（隐含 --quick）")
+    p_hostcheck.add_argument("--skip-vllm-import", dest="skip_vllm_import", action="store_true",
+                             help="跳过 import vllm 检查")
+    p_hostcheck.add_argument("--skip-gpu", dest="skip_gpu", action="store_true",
+                             help="跳过 GPU SMI 采样")
+    p_hostcheck.add_argument("--prelude", default=None,
+                             help="厂商 prelude 脚本列表（空格分隔，默认 $HOST_PRELUDE_FILES）")
+    p_hostcheck.set_defaults(func=cmd_hostcheck)
 
     return parser
 

@@ -110,9 +110,24 @@ fi
 : "${PYTHONPATH_IN_CONTAINER:=}"
 : "${SHM_SIZE:=16g}"
 
+# --- 运行时：docker（默认）| host（物理机裸跑，无容器） ---
+# 对 docker 模式无影响；host 相关默认值见下方「运行时抽象」一节。
+: "${RUNTIME:=docker}"                 # docker | host（别名 container→docker、bare/native→host）
+: "${HOST_PYTHON:=python3}"            # host 模式使用的宿主机 python 解释器
+: "${HOST_SERVE_ENTRYPOINT:=}"         # 留空 → 用 $HOST_PYTHON 执行 vLLM 的 CLI 入口
+: "${HOST_PRECHECK:=1}"                # 1 = host 启动前跑 scripts/host_check.sh（--skip-check 可跳过）
+: "${HOST_PRELUDE_FILES:=}"            # host 启动前要 source 的宿主机环境脚本（空格分隔）
+: "${HOST_STOP_TIMEOUT:=60}"           # host 停止时 SIGTERM 后等待秒数，超时 SIGKILL
+: "${HOST_VLLM_PATTERN:=vllm.entrypoints.cli.main|vllm\.v1\.engine|EngineCore|APIServer}"
+: "${PYSPY_BIN:=py-spy}"               # host 模式栈采样使用的 py-spy 可执行文件
+# 1 = 停止后跳过显存释放等待（测试/CI/同机已有其它显存占用时很有用）
+: "${PROBE_SKIP_VRAM_WAIT:=0}"
+
 export IMAGE CONTAINER MODE EXEC_CONTAINER SRC_DIR MODEL SERVED_NAME HOST PORT TP DTYPE
 export GPU_MEM_UTIL MAX_MODEL_LEN MAX_NUM_BATCHED_TOKENS MAX_NUM_SEQS EAGER VISIBLE_DEVICES
 export DRAFT_MODEL SPEC_METHOD SPEC_TOKENS PROBE_LEVEL RUNS_DIR WARMUP_TIMEOUT
+export RUNTIME HOST_PYTHON HOST_SERVE_ENTRYPOINT HOST_PRECHECK HOST_PRELUDE_FILES
+export HOST_STOP_TIMEOUT HOST_VLLM_PATTERN PYSPY_BIN PROBE_SKIP_VRAM_WAIT
 
 # ---------------------------------------------------------------------------
 # 厂商适配层（vendors/<id>.sh ↔ probe/vendors.py）
@@ -273,6 +288,45 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "缺少命令：$1"
 }
 
+# ---------------------------------------------------------------------------
+# 运行时抽象：docker（默认）| host（物理机裸跑）
+#   RUNTIME=docker : 通过 docker run / docker exec 跑（原有行为）
+#   RUNTIME=host   : 直接在物理机上起 vLLM（不经过容器）
+# 别名：container→docker、bare/native→host；大小写不敏感。
+# 本文件 source 时会立即 normalize 并 export；非法值直接 die。
+# ---------------------------------------------------------------------------
+runtime_normalize() {
+  local r="${1:-${RUNTIME:-docker}}"
+  r="$(printf '%s' "$r" | tr '[:upper:]' '[:lower:]')"
+  case "$r" in
+    ""|docker|container) printf 'docker' ;;
+    host|bare|native)    printf 'host' ;;
+    *) die "RUNTIME 非法：$r（可用：docker|host；别名 container→docker、bare/native→host）" ;;
+  esac
+}
+
+# 注意：两个判定函数每次都读「当前」$RUNTIME（不缓存），便于脚本 source 后再改。
+runtime_is_host()   { [[ "${RUNTIME:-docker}" == "host" ]]; }
+runtime_is_docker() { [[ "${RUNTIME:-docker}" == "docker" ]]; }
+
+# 校验当前运行时所需的宿主依赖（只应在脚本里调用；source 本文件时不执行，
+# 因此没有 docker 的物理机也能 source 并跑 host 模式）。
+runtime_require() {
+  if runtime_is_host; then
+    local py
+    py="$(host_python)"
+    if ! command -v "$py" >/dev/null 2>&1 && [[ ! -x "$py" ]]; then
+      die "RUNTIME=host 需要可执行的 HOST_PYTHON：$py（在 .env 里设置 HOST_PYTHON，或把 python3 放进 PATH）"
+    fi
+    require_cmd curl
+  else
+    require_cmd docker
+  fi
+}
+
+RUNTIME="$(runtime_normalize "${RUNTIME:-docker}")"
+export RUNTIME
+
 # 厂商探测在日志/工具函数就绪之后执行（detect_vendor 会在参数非法时调用 die）
 detect_vendor
 
@@ -298,12 +352,301 @@ new_run_dir() {
   echo "$dir"
 }
 
+# 最新运行目录：优先 $RUN_DIR，否则 RUNS_DIR 下最新目录。
+# 找不到时 return 1（**不要 die**）：本函数几乎都用在
+#   `RUN_DIR="$(latest_run_dir 2>/dev/null || new_run_dir <tag>)"`
+# 或 `if ! RUN_DIR="$(latest_run_dir 2>/dev/null)"; then ...` 里，
+# 若在这里 die(exit) 只会退出命令替换的子 shell，调用方的 `||` 分支反而走不到，
+# set -e 下脚本会静默退出（全新机器还没有 runs/ 目录时必现）。
 latest_run_dir() {
   if [[ -n "$RUN_DIR" ]]; then echo "$RUN_DIR"; return 0; fi
   local latest
   latest="$(ls -1d "$RUNS_DIR"/*/ 2>/dev/null | sort | tail -1 || true)"
-  [[ -n "$latest" ]] || die "找不到任何运行目录（$RUNS_DIR），请先执行 scripts/start_vllm.sh"
+  [[ -n "$latest" ]] || return 1
   echo "${latest%/}"
+}
+
+# ---------------------------------------------------------------------------
+# host（物理机裸跑）运行时辅助
+#
+# 产物约定（<RUN_DIR> 下）：
+#   serve.pid        进程组组长 PID（setsid 起的会话 leader）
+#   serve.pgid       进程组 ID（正常情况下与 serve.pid 相同）
+#   serve_launch.sh 生成的启动脚本（cd → source host prelude → export 环境 → exec vLLM）
+#   serve.log        stdout/stderr
+# ---------------------------------------------------------------------------
+host_python() {
+  printf '%s' "${HOST_PYTHON:-python3}"
+}
+
+# host 模式的 vLLM 启动入口（与容器内 SERVE_ENTRYPOINT 等价，只是换成宿主机 python）
+host_serve_entrypoint() {
+  if [[ -n "${HOST_SERVE_ENTRYPOINT:-}" ]]; then
+    printf '%s' "$HOST_SERVE_ENTRYPOINT"
+  else
+    printf "%s -c 'import torch; from vllm.entrypoints.cli.main import main; main()'" "$(host_python)"
+  fi
+}
+
+# host 模式的 PYTHONPATH：源码 checkout + 工具包根（+ triton 安装目录 + 插件目录）
+host_pythonpath() {
+  local -a parts=()
+  if [[ -n "${SRC_DIR:-}" ]]; then parts+=("$SRC_DIR"); fi
+  parts+=("$PROJECT_ROOT")
+  if [[ -n "${TRITON_INSTALL_DIR:-}" ]]; then parts+=("$TRITON_INSTALL_DIR"); fi
+  if [[ "${PROBE_PLUGIN:-0}" == "1" && -n "${RUN_DIR:-}" ]]; then
+    parts+=("$RUN_DIR/.probe_plugins")
+  fi
+  local IFS=':'
+  printf '%s' "${parts[*]}"
+}
+
+# host 模式启动前 source 的宿主机环境脚本（空格分隔；不存在的文件静默跳过）
+host_prelude_shell() {
+  local out="" f q
+  for f in ${HOST_PRELUDE_FILES:-}; do
+    [[ -n "$f" ]] || continue
+    q="$(printf '%q' "$f")"
+    out+="if [ -f $q ]; then . $q >/dev/null 2>&1 || true; fi; "
+  done
+  printf '%s' "$out"
+}
+
+# 解析要操作的 run dir：显式参数 → $RUN_DIR → 最新 runs/* 目录；找不到返回空（不 die）
+_host_resolve_run_dir() {
+  local run_dir="${1:-${RUN_DIR:-}}"
+  if [[ -z "$run_dir" ]]; then
+    run_dir="$(ls -1d "$RUNS_DIR"/*/ 2>/dev/null | sort | tail -1 || true)"
+    run_dir="${run_dir%/}"
+  fi
+  printf '%s' "$run_dir"
+}
+
+# host 实例 PID（读 <run_dir>/serve.pid；不存在/非法返回 1）
+host_instance_pid() {
+  local run_dir pid
+  run_dir="$(_host_resolve_run_dir "${1:-}")"
+  [[ -n "$run_dir" && -f "$run_dir/serve.pid" ]] || return 1
+  pid="$(cat "$run_dir/serve.pid" 2>/dev/null || true)"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$pid"
+}
+
+# host 实例进程组 ID（优先 serve.pgid，缺失时回退 serve.pid）
+host_instance_pgid() {
+  local run_dir pgid pid
+  run_dir="$(_host_resolve_run_dir "${1:-}")"
+  [[ -n "$run_dir" ]] || return 1
+  pgid=""
+  if [[ -f "$run_dir/serve.pgid" ]]; then
+    pgid="$(cat "$run_dir/serve.pgid" 2>/dev/null || true)"
+  fi
+  if [[ ! "$pgid" =~ ^[0-9]+$ ]]; then
+    pid="$(host_instance_pid "$run_dir" 2>/dev/null || true)"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    pgid="$pid"
+  fi
+  printf '%s\n' "$pgid"
+}
+
+# host 实例是否在运行（只认 serve.pid，不会像 pgrep 那样误伤现网进程）
+host_instance_running() {
+  local pid
+  pid="$(host_instance_pid "${1:-}" 2>/dev/null || true)"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+# host_start <run_dir> <log_file> <launcher>
+# 用 setsid+nohup 在后台起 launcher，stdout/stderr 全量重定向到 log_file；
+# 真实会话 leader PID 写入 serve.pid/serve.pgid（stop 时可按 -PGID 整组终止）。
+host_start() {
+  local run_dir="$1" log_file="$2" launcher="$3"
+  [[ -n "$run_dir" && -n "$log_file" && -n "$launcher" ]] || die "host_start 参数不全：<run_dir> <log_file> <launcher>"
+  command -v setsid >/dev/null 2>&1 || die "RUNTIME=host 需要 setsid 命令（util-linux）"
+  mkdir -p "$run_dir" "$(dirname "$log_file")"
+  rm -f "$run_dir/serve.pid" "$run_dir/serve.pgid"
+  # setsid 在少数情况下会 fork；不直接记 $!，而是让会话 leader 自己把 $$ 落盘，
+  # 再 exec launcher（exec 保持 PID，PGID == 该 PID）。
+  setsid nohup bash -c 'printf "%s\n" "$$" > "$1/serve.pid"; exec bash "$2"' _ \
+    "$run_dir" "$launcher" > "$log_file" 2>&1 < /dev/null &
+  local waited pid=""
+  for waited in $(seq 1 50); do
+    if [[ -s "$run_dir/serve.pid" ]]; then
+      pid="$(cat "$run_dir/serve.pid" 2>/dev/null || true)"
+      if [[ "$pid" =~ ^[0-9]+$ ]]; then break; fi
+    fi
+    sleep 0.1
+  done
+  if [[ ! "$pid" =~ ^[0-9]+$ ]]; then
+    die "host 后台启动失败：$launcher（见日志 $log_file）"
+  fi
+  if ! kill -0 "$pid" 2>/dev/null; then
+    die "host launcher 启动后立即退出（PID=$pid）；日志：$log_file"
+  fi
+  printf '%s\n' "$pid" > "$run_dir/serve.pgid"
+  printf '%s\n' "$pid"
+}
+
+# host_stop [--run-dir D] [--timeout N] [--force]
+# 先 SIGTERM 整个进程组，等待 timeout 秒仍存活则 SIGKILL；--force 直接 SIGKILL。
+# 返回：0=已停止/本来就没在跑；1=没有 pid 记录；2=进程组仍在（需要人工确认）。
+host_stop() {
+  local run_dir="${RUN_DIR:-}" timeout="${HOST_STOP_TIMEOUT:-60}" force=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --run-dir) run_dir="${2:?}"; shift 2 ;;
+      --timeout) timeout="${2:?}"; shift 2 ;;
+      --force) force=1; shift ;;
+      *) die "host_stop 未知参数：$1" ;;
+    esac
+  done
+  run_dir="$(_host_resolve_run_dir "$run_dir")"
+  local pid="" pgid="" target=""
+  pid="$(host_instance_pid "$run_dir" 2>/dev/null || true)"
+  pgid="$(host_instance_pgid "$run_dir" 2>/dev/null || true)"
+  target="$pgid"
+  [[ -n "$target" ]] || target="$pid"
+  if [[ -z "$pid" && -z "$pgid" && -z "$run_dir" ]]; then
+    warn "host 实例无 pid 记录（未指定 / 找不到运行目录）"
+    return 1
+  fi
+  if [[ -z "$pid" && -z "$pgid" ]]; then
+    warn "host 实例无 pid 记录：$run_dir/serve.pid（可能未用 host 模式启动）"
+    return 1
+  fi
+
+  local alive=0
+  if [[ -n "$target" ]] && kill -0 -- "-$target" 2>/dev/null; then
+    alive=1
+  elif [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    alive=1
+  fi
+  if (( ! alive )); then
+    log "host 实例已不在运行（PID=${pid:-?} PGID=${target:-?}）"
+    return 0
+  fi
+
+  if (( force )); then
+    warn "host_stop --force：跳过 SIGTERM，直接 SIGKILL 进程组 PGID=$target"
+  else
+    log "终止 host 进程组 PGID=$target（SIGTERM，最多等待 ${timeout}s）"
+    kill -TERM -- "-$target" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    local waited=0 still=1
+    while (( waited < timeout )); do
+      if ! kill -0 -- "-$target" 2>/dev/null; then still=0; break; fi
+      sleep 1
+      waited=$((waited + 1))
+    done
+    if (( still )); then
+      warn "进程组 PGID=$target 在 ${timeout}s 内未退出，发送 SIGKILL"
+    fi
+  fi
+  if kill -0 -- "-$target" 2>/dev/null; then
+    kill -KILL -- "-$target" 2>/dev/null || true
+    sleep 1
+  fi
+  if kill -0 -- "-$target" 2>/dev/null; then
+    warn "host 进程组 PGID=$target 仍存活，请手动检查：ps -o pid,pgid,args -g $target"
+    return 2
+  fi
+  ok "host 实例已停止（PGID=$target；pid 记录保留在 $run_dir）"
+  return 0
+}
+
+# host_stop_pattern [pattern]
+# 按进程名强杀宿主机上所有匹配 vLLM 的进程（等价容器 --kill-exec 的语义，慎用：
+# 会误伤其它实验，包括不是本工具启动的 vLLM）。
+host_stop_pattern() {
+  local pattern="${1:-$HOST_VLLM_PATTERN}"
+  local -a pids=() live=() remain=()
+  mapfile -t pids < <(pgrep -f "$pattern" 2>/dev/null || true)
+  local p
+  for p in "${pids[@]+"${pids[@]}"}"; do
+    [[ -n "$p" ]] || continue
+    if [[ "$p" == "$$" || "$p" == "$PPID" ]]; then continue; fi
+    live+=("$p")
+  done
+  if [[ ${#live[@]} -eq 0 ]]; then
+    warn "本机没有匹配 vLLM 的进程（pattern: $pattern）"
+    return 0
+  fi
+  warn "准备终止本机所有匹配 vLLM 的进程（pattern: $pattern）：${live[*]}"
+  kill -TERM "${live[@]}" 2>/dev/null || true
+  local waited=0 any=0
+  for waited in $(seq 1 10); do
+    any=0
+    for p in "${live[@]}"; do
+      if kill -0 "$p" 2>/dev/null; then any=1; fi
+    done
+    if (( ! any )); then break; fi
+    sleep 1
+  done
+  for p in "${live[@]}"; do
+    if kill -0 "$p" 2>/dev/null; then remain+=("$p"); fi
+  done
+  if [[ ${#remain[@]} -gt 0 ]]; then
+    warn "以下进程未响应 SIGTERM，发送 SIGKILL：${remain[*]}"
+    kill -KILL "${remain[@]}" 2>/dev/null || true
+  fi
+  ok "已按 pattern 终止 vLLM 进程（pattern: $pattern）"
+  return 0
+}
+
+# host 上匹配 vLLM 的 PID（每行一个；无进程时输出为空并返回 0）
+host_vllm_pids() {
+  local p
+  while IFS= read -r p; do
+    [[ -n "$p" ]] || continue
+    if [[ "$p" == "$$" || "$p" == "$PPID" ]]; then continue; fi
+    printf '%s\n' "$p"
+  done < <(pgrep -f "$HOST_VLLM_PATTERN" 2>/dev/null || true)
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# 跨运行时实例辅助（status/watch_steps/pyspy/probe_all 用）
+# ---------------------------------------------------------------------------
+# 当前实例的运行目录：优先 $RUN_DIR，否则 RUNS_DIR 下最新目录；找不到输出空并返回 1。
+instance_run_dir() {
+  local d
+  d="$(_host_resolve_run_dir "${1:-}")"
+  [[ -n "$d" ]] || return 1
+  printf '%s\n' "$d"
+}
+
+# 当前实例是否在运行（host 看 serve.pid，docker 看容器状态）
+instance_running() {
+  if runtime_is_host; then
+    host_instance_running "${1:-}"
+  else
+    container_running "$CONTAINER"
+  fi
+}
+
+# 一行描述当前实例；有存活实例返回 0，否则返回 1（仍打印状态描述）。
+instance_describe() {
+  if runtime_is_host; then
+    local pid pgid
+    pid="$(host_instance_pid "${1:-}" 2>/dev/null || true)"
+    pgid="$(host_instance_pgid "${1:-}" 2>/dev/null || true)"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+      printf 'host（PID=%s PGID=%s）' "$pid" "${pgid:-$pid}"
+      return 0
+    fi
+    printf 'host（未运行）'
+    return 1
+  fi
+  if container_running "$CONTAINER"; then
+    printf 'docker 容器=%s（运行中）' "$CONTAINER"
+    return 0
+  fi
+  if container_exists "$CONTAINER"; then
+    printf 'docker 容器=%s（已停止）' "$CONTAINER"
+  else
+    printf 'docker（无容器 %s）' "$CONTAINER"
+  fi
+  return 1
 }
 
 # ---------------------------------------------------------------------------

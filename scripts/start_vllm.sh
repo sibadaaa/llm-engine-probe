@@ -1,15 +1,23 @@
 #!/usr/bin/env bash
-# 在 docker 中启动一个"可观测的" vLLM 实例。
+# 启动一个"可观测的" vLLM 实例。
+#
+# 运行时（RUNTIME，默认 docker）：
+#   docker : 在容器里起（原有行为；设备直通/挂载来自 vendors/<id>.sh）
+#   host   : 物理机（裸机）直接起，不经过容器（见 scripts/lib/common.sh 的 host_*）
 #
 # 多厂商：容器设备直通 / 可见性环境变量 / 启动前 source 的环境脚本全部来自
 # vendors/<id>.sh（VENDOR=auto 时自动探测，见 vendors/README.md）。
-# 观测档位与厂商无关，见下。
+# 观测档位与厂商、运行时均无关，见下。
 #
 # 用法：
-#   scripts/start_vllm.sh                        # 按 .env 的 PROBE_LEVEL 启动
+#   scripts/start_vllm.sh                        # 按 .env 的 RUNTIME/PROBE_LEVEL 启动
+#   scripts/start_vllm.sh --host                 # 物理机裸跑（等价 RUNTIME=host）
+#   scripts/start_vllm.sh --docker               # 强制 docker（覆盖 .env 的 RUNTIME）
+#   scripts/start_vllm.sh --runtime host         # 同上；别名 container/bare/native 可用
 #   scripts/start_vllm.sh --level kernel         # 临时切到算子级观测档位
-#   scripts/start_vllm.sh --dry-run              # 只打印将执行的命令，不启动
-#   scripts/start_vllm.sh --exec                 # 复用已有容器（docker exec -d）
+#   scripts/start_vllm.sh --dry-run              # 只打印将执行的命令，不启动、不预检
+#   scripts/start_vllm.sh --exec                 # 复用已有容器（docker exec -d；host 不支持）
+#   scripts/start_vllm.sh --skip-check           # host 模式跳过 scripts/host_check.sh 预检
 #   VENDOR=nvidia scripts/start_vllm.sh          # 显式指定厂商（覆盖自动探测）
 #
 # 观测档位 PROBE_LEVEL：
@@ -20,6 +28,7 @@
 #   kernel  deep + torch profiler（配合 /start_profile）+ 逐层 NVTX
 #
 # 所有开关与取值都会写进 <RUN_DIR>/run_meta.json 与 <RUN_DIR>/cmd.txt，保证可复现。
+# host 模式额外产物：<RUN_DIR>/serve.pid、serve.pgid、serve_launch.sh（见 common.sh）。
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,6 +40,7 @@ DRY_RUN=0
 FOREGROUND=0
 TAG="serve"
 DO_WAIT=1
+SKIP_CHECK=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --level) LEVEL="${2:?}"; shift 2 ;;
@@ -40,18 +50,34 @@ while [[ $# -gt 0 ]]; do
     --no-wait) DO_WAIT=0; shift ;;
     --run-dir) RUN_DIR="${2:?}"; shift 2 ;;
     --exec) MODE=exec; shift ;;
-    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
+    --host) RUNTIME=host; shift ;;
+    --docker) RUNTIME=docker; shift ;;
+    --runtime) RUNTIME="${2:?}"; shift 2 ;;
+    --skip-check) SKIP_CHECK=1; shift ;;
+    -h|--help) sed -n '2,31p' "$0"; exit 0 ;;
     *) die "未知参数：$1（-h 查看用法）" ;;
   esac
 done
 [[ -n "$LEVEL" ]] || LEVEL="$PROBE_LEVEL"
 
-require_cmd docker
+# 运行时归一化（--host/--docker/--runtime 可覆盖 .env）+ 校验宿主依赖
+RUNTIME="$(runtime_normalize "${RUNTIME:-docker}")"
+export RUNTIME
+runtime_require
+
 case "$LEVEL" in off|basic|steps|deep|kernel) ;; *) die "PROBE_LEVEL 非法：$LEVEL（off|basic|steps|deep|kernel）" ;; esac
 
+if runtime_is_host; then
+  [[ "$MODE" == "run" ]] || die "RUNTIME=host 不支持 MODE=$MODE（MODE=exec 只用于复用已有容器；host 模式请去掉 --exec）"
+else
+  case "$MODE" in run|exec) ;; *) die "MODE 非法：$MODE（run|exec）" ;; esac
+fi
+
 [[ -n "$MODEL" ]] || die "MODEL 未设置：请在 .env 里指定模型目录（参考 .env.example）"
-[[ -n "$IMAGE" ]] || die "IMAGE 未设置且厂商（$VENDOR）没有默认镜像：请在 .env 里指定 IMAGE。提示：$VENDOR_IMAGE_HINT"
-[[ -n "$SERVED_NAME" ]] || SERVED_NAME="$(basename "$MODEL")"
+if runtime_is_docker; then
+  [[ -n "$IMAGE" ]] || die "IMAGE 未设置且厂商（$VENDOR）没有默认镜像：请在 .env 里指定 IMAGE。提示：$VENDOR_IMAGE_HINT"
+fi
+if [[ -z "$SERVED_NAME" ]]; then SERVED_NAME="$(basename "$MODEL")"; fi
 if [[ -n "$DRAFT_MODEL" && -z "$SPEC_METHOD" ]]; then
   die "配置了 DRAFT_MODEL 但没有 SPEC_METHOD（如 dflash / mtp / eagle）：请在 .env 里设置"
 fi
@@ -63,10 +89,15 @@ mkdir -p "$TRACE_DIR" "$RUN_DIR"
 
 # PORT 是宿主机端口（探针访问用）；INTERNAL_PORT 是容器内 vLLM 监听端口。
 # MODE=run 时二者默认相同；配合 docker-compose.yml 时通常 INTERNAL_PORT=8000。
-: "${INTERNAL_PORT:=$PORT}"
+# host 模式没有容器，vLLM 直接监听 PORT。
+if runtime_is_host; then
+  INTERNAL_PORT="$PORT"
+else
+  : "${INTERNAL_PORT:=$PORT}"
+fi
 
 # ---------------------------------------------------------------------------
-# 1. 服务参数
+# 1. 服务参数（docker/host 完全共用）
 # ---------------------------------------------------------------------------
 ARGS=(serve "$MODEL"
   --served-model-name "$SERVED_NAME"
@@ -93,10 +124,11 @@ if [[ -n "$DRAFT_MODEL" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 2. 观测开关（按档位叠加；与厂商无关）
+# 2. 观测开关（按档位叠加；与厂商、运行时无关）
 # ---------------------------------------------------------------------------
-ENVS=()
-add_env() { ENVS+=(-e "$1"); }
+# ENV_KVS 是唯一的 K=V 来源：docker 侧再派生成 -e，host 侧写进 serve_launch.sh。
+ENV_KVS=()
+add_env() { ENV_KVS+=("$1"); }
 
 case "$LEVEL" in
   off)   LEVEL_DESC="关闭全部可选观测开关（对照基线）" ;;
@@ -139,8 +171,14 @@ if [[ "$LEVEL" == "deep" || "$LEVEL" == "kernel" ]]; then
 fi
 
 if [[ "$LEVEL" == "kernel" ]]; then
-  PROFILER_JSON=$(printf '{"profiler":"torch","torch_profiler_dir":"/traces","torch_profiler_with_stack":%s,"torch_profiler_with_flops":%s,"torch_profiler_record_shapes":%s,"torch_profiler_with_memory":%s,"torch_profiler_dump_cuda_time_total":true}' \
-    "$PROFILER_WITH_STACK" "$PROFILER_WITH_FLOPS" "$PROFILER_RECORD_SHAPES" "$PROFILER_WITH_MEMORY")
+  # torch profiler 落盘目录：docker 用容器内挂载点 /traces；host 直接写 run 目录（绝对路径）
+  if runtime_is_host; then
+    PROFILER_DIR="$TRACE_DIR"
+  else
+    PROFILER_DIR="/traces"
+  fi
+  PROFILER_JSON=$(printf '{"profiler":"torch","torch_profiler_dir":"%s","torch_profiler_with_stack":%s,"torch_profiler_with_flops":%s,"torch_profiler_record_shapes":%s,"torch_profiler_with_memory":%s,"torch_profiler_dump_cuda_time_total":true}' \
+    "$PROFILER_DIR" "$PROFILER_WITH_STACK" "$PROFILER_WITH_FLOPS" "$PROFILER_RECORD_SHAPES" "$PROFILER_WITH_MEMORY")
   ARGS+=(--profiler-config "$PROFILER_JSON")
   # 把引擎内部的 record_function 范围打进 trace（CPU 侧阶段分布）
   add_env "VLLM_CUSTOM_SCOPES_FOR_PROFILING=$ENABLE_PROFILING_SCOPES"
@@ -168,24 +206,32 @@ fi
 # （逐 step 批次、逐请求 queue/prefill/decode/e2e/TPOT、KV 驱逐、按位置接受数…）。
 # ---------------------------------------------------------------------------
 PLUGIN_SETUP=""
+PROBE_LOG_PATH=""
 if [[ "$PROBE_PLUGIN" == "1" ]]; then
   if [[ "$LEVEL" == "off" || "$LEVEL" == "basic" ]]; then
     warn "PROBE_PLUGIN=1 但档位是 $LEVEL：逐 step 明细需要 --enable-logging-iteration-details，建议用 steps/deep/kernel"
   fi
-  if [[ "$MODE" == "exec" ]]; then
-    PROBE_LOG_CONTAINER="${EXEC_LOG_DIR:-${GAME_DIR:-/tmp}/vllm-probe}/$PROBE_LOG_NAME"
+  if runtime_is_host; then
+    # host：插件装到 run 目录（见下方安装步骤），JSONL 直接写宿主机 run 目录
+    PROBE_LOG_PATH="$RUN_DIR/$PROBE_LOG_NAME"
+  elif [[ "$MODE" == "exec" ]]; then
+    PROBE_LOG_PATH="${EXEC_LOG_DIR:-${GAME_DIR:-/tmp}/vllm-probe}/$PROBE_LOG_NAME"
   else
-    PROBE_LOG_CONTAINER="/logs/$PROBE_LOG_NAME"
+    PROBE_LOG_PATH="/logs/$PROBE_LOG_NAME"
   fi
-  add_env "VLLM_PROBE_LOG=$PROBE_LOG_CONTAINER"
-  # 关键：在容器内 /tmp 复制一份再安装，避免容器里的 root 在宿主机工作区留下
-  # root 属主的 egg-info / __pycache__（实测踩过这个坑）。
-  PLUGIN_SETUP="python3 -c 'import vllm_probe_stat_logger' 2>/dev/null || "
-  PLUGIN_SETUP+="{ rm -rf /tmp/vllm-probe-plugin && cp -r /opt/vllm-probe/plugin_probe /tmp/vllm-probe-plugin && "
-  PLUGIN_SETUP+="pip install -q --no-deps --no-build-isolation -e /tmp/vllm-probe-plugin >/dev/null 2>&1 "
-  PLUGIN_SETUP+="&& echo '[probe] stat logger 插件已安装(JSONL)'; } || "
-  PLUGIN_SETUP+="echo '[probe] 警告: stat logger 插件安装失败（不影响推理，仅缺 JSONL）' >&2; "
-  log "stat logger 插件：开（JSONL → $PROBE_LOG_CONTAINER）"
+  add_env "VLLM_PROBE_LOG=$PROBE_LOG_PATH"
+  if runtime_is_host; then
+    log "stat logger 插件：开（host；JSONL → $PROBE_LOG_PATH）"
+  else
+    # 关键：在容器内 /tmp 复制一份再安装，避免容器里的 root 在宿主机工作区留下
+    # root 属主的 egg-info / __pycache__（实测踩过这个坑）。
+    PLUGIN_SETUP="python3 -c 'import vllm_probe_stat_logger' 2>/dev/null || "
+    PLUGIN_SETUP+="{ rm -rf /tmp/vllm-probe-plugin && cp -r /opt/vllm-probe/plugin_probe /tmp/vllm-probe-plugin && "
+    PLUGIN_SETUP+="pip install -q --no-deps --no-build-isolation -e /tmp/vllm-probe-plugin >/dev/null 2>&1 "
+    PLUGIN_SETUP+="&& echo '[probe] stat logger 插件已安装(JSONL)'; } || "
+    PLUGIN_SETUP+="echo '[probe] 警告: stat logger 插件安装失败（不影响推理，仅缺 JSONL）' >&2; "
+    log "stat logger 插件：开（JSONL → $PROBE_LOG_PATH）"
+  fi
 else
   log "stat logger 插件：关（PROBE_PLUGIN=1 可开启；提供最细的逐 step/逐请求结构化数据）"
 fi
@@ -204,7 +250,7 @@ if [[ -n "${EXTRA_ARGS_FILE:-}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 3. 环境变量（通用 + 厂商适配）
+# 3. 环境变量（通用 + 厂商适配；docker/host 共用同一份 K=V）
 # ---------------------------------------------------------------------------
 if [[ -n "$VENDOR_DEVICE_VIS_ENV" ]]; then
   add_env "$VENDOR_DEVICE_VIS_ENV=$VISIBLE_DEVICES"
@@ -222,21 +268,30 @@ add_env "PYTHONUNBUFFERED=1"
 [[ -n "$VLLM_CACHE_ROOT" ]] && add_env "VLLM_CACHE_ROOT=$VLLM_CACHE_ROOT"
 [[ -n "$TRITON_CACHE_DIR" ]] && add_env "TRITON_CACHE_DIR=$TRITON_CACHE_DIR"
 add_env "VLLM_NO_USAGE_STATS=${VLLM_NO_USAGE_STATS:-1}"
-add_env "PYTHONPATH=$(container_pythonpath)"
+if runtime_is_host; then
+  add_env "PYTHONPATH=$(host_pythonpath)"
+else
+  add_env "PYTHONPATH=$(container_pythonpath)"
+fi
 [[ -n "${PROMETHEUS_DISABLE_CREATED_SERIES:-}" ]] && add_env "PROMETHEUS_DISABLE_CREATED_SERIES=$PROMETHEUS_DISABLE_CREATED_SERIES"
 if [[ -n "$EXTRA_ENV" ]]; then
   for kv in $EXTRA_ENV; do add_env "$kv"; done
 fi
 
 # ---------------------------------------------------------------------------
-# 4. 组装容器内命令
+# 4. 组装启动命令
 # ---------------------------------------------------------------------------
-SERVE_ENTRYPOINT="${SERVE_ENTRYPOINT:-python3 -c 'import torch; from vllm.entrypoints.cli.main import main; main()'}"
-CMD_STR="$SERVE_ENTRYPOINT $(quote_argv "${ARGS[@]}")"
+if runtime_is_host; then
+  SERVE_ENTRYPOINT_ACTUAL="$(host_serve_entrypoint)"
+else
+  SERVE_ENTRYPOINT_ACTUAL="${SERVE_ENTRYPOINT:-python3 -c 'import torch; from vllm.entrypoints.cli.main import main; main()'}"
+fi
+CMD_STR="$SERVE_ENTRYPOINT_ACTUAL $(quote_argv "${ARGS[@]}")"
 
 echo "$CMD_STR" > "$RUN_DIR/cmd.txt"
 {
   echo "# 观测档位: $LEVEL ($LEVEL_DESC)"
+  echo "# 运行时: $RUNTIME"
   echo "# 厂商: $VENDOR ($VENDOR_LABEL)"
   echo "# 生成时间: $(date -Is)"
   echo "$CMD_STR"
@@ -249,16 +304,44 @@ INNER_WORKDIR="/src"
 PRELUDE="$(vendor_prelude_shell)"
 INNER_CMD="cd $INNER_WORKDIR && ${PRELUDE}export PYTHONPATH=$(container_pythonpath); ${PLUGIN_SETUP}exec $CMD_STR"
 
-# run_meta.json（供报告读取）
+# host 模式的版本信息（best-effort；装不了 vllm/torch 时对应字段为 null）
+HOST_META_JSON=""
+if runtime_is_host; then
+  HOST_META_JSON="$(HOST_PY_NAME="$(host_python)" "$(host_python)" - <<'PY' 2>/dev/null || true
+import json, os, platform, socket
+
+def _ver(mod):
+    try:
+        m = __import__(mod)
+        return getattr(m, "__version__", None)
+    except Exception:
+        return None
+
+print(json.dumps({
+    "python": os.environ.get("HOST_PY_NAME") or None,
+    "python_version": platform.python_version(),
+    "vllm_version": _ver("vllm"),
+    "torch_version": _ver("torch"),
+    "hostname": socket.gethostname(),
+    "kernel": platform.release(),
+}, ensure_ascii=False))
+PY
+)"
+  [[ -n "$HOST_META_JSON" ]] || HOST_META_JSON='{"python": null, "python_version": null, "vllm_version": null, "torch_version": null, "hostname": null, "kernel": null}'
+fi
+
+# run_meta.json（供报告读取；docker/host 都有，host 额外带 host 段）
 RUN_META_DIR="$RUN_DIR" MODEL="$MODEL" SERVED_NAME="$SERVED_NAME" PORT="$PORT" TP="$TP" \
 MAX_MODEL_LEN="$MAX_MODEL_LEN" MAX_NUM_BATCHED_TOKENS="$MAX_NUM_BATCHED_TOKENS" EAGER="$EAGER" \
 PROBE_LEVEL="$LEVEL" LEVEL_DESC="$LEVEL_DESC" CONTAINER="$CONTAINER" IMAGE="$IMAGE" \
-STARTED_AT="$(date -Is)" CMD_STR="$CMD_STR" py - <<'PY'
+RUNTIME="$RUNTIME" HOST_META_JSON="$HOST_META_JSON" STARTED_AT="$(date -Is)" CMD_STR="$CMD_STR" py - <<'PY'
 import json, os
+runtime = os.environ["RUNTIME"]
 meta = {
     "started_at": os.environ["STARTED_AT"],
-    "image": os.environ["IMAGE"],
-    "container": os.environ["CONTAINER"],
+    "runtime": runtime,
+    "image": os.environ["IMAGE"] if runtime == "docker" else "",
+    "container": os.environ["CONTAINER"] if runtime == "docker" else "",
     "vendor": os.environ.get("VENDOR", ""),
     "vendor_label": os.environ.get("VENDOR_LABEL", ""),
     "model": os.environ["MODEL"],
@@ -272,6 +355,16 @@ meta = {
     "probe_level_desc": os.environ["LEVEL_DESC"],
     "command": os.environ["CMD_STR"],
 }
+if runtime == "host":
+    keys = ("python", "python_version", "vllm_version", "torch_version", "hostname", "kernel")
+    try:
+        meta["host"] = json.loads(os.environ.get("HOST_META_JSON") or "{}")
+    except Exception:
+        meta["host"] = {}
+    if not isinstance(meta.get("host"), dict):
+        meta["host"] = {}
+    for k in keys:
+        meta["host"].setdefault(k, None)
 open(os.path.join(os.environ["RUN_META_DIR"], "run_meta.json"), "w").write(
     json.dumps(meta, ensure_ascii=False, indent=2)
 )
@@ -284,90 +377,201 @@ log "观测档位：$LEVEL（$LEVEL_DESC）"
 # ---------------------------------------------------------------------------
 # 5. 启动
 # ---------------------------------------------------------------------------
-if [[ "$MODE" == "run" ]]; then
-  if container_exists "$CONTAINER"; then
-    if container_running "$CONTAINER"; then
-      die "容器 $CONTAINER 已在运行；先执行 scripts/stop_vllm.sh，或设置 CONTAINER=其它名字"
+if runtime_is_host; then
+  # ---- host（物理机裸跑）----
+  LAUNCHER="$RUN_DIR/serve_launch.sh"
+  WORKDIR="$PROJECT_ROOT"
+  if [[ -n "$SRC_DIR" && -d "$SRC_DIR" ]]; then WORKDIR="$SRC_DIR"; fi
+  HOST_PRELUDE="$(host_prelude_shell)"
+  {
+    echo '#!/usr/bin/env bash'
+    echo '# 由 scripts/start_vllm.sh 生成：host（物理机裸跑）启动脚本'
+    echo '# 环境变量来自与 docker 模式完全相同的 ENV_KVS，便于复现/对比。'
+    echo 'set -euo pipefail'
+    printf 'cd %q\n' "$WORKDIR"
+    if [[ -n "$HOST_PRELUDE" ]]; then
+      printf '%s\n' "$HOST_PRELUDE"
+    else
+      echo '# （HOST_PRELUDE_FILES 为空，跳过宿主机环境脚本）'
     fi
-    log "移除已退出的同名容器 $CONTAINER"
-    docker rm "$CONTAINER" >/dev/null
-  fi
-
-  DOCKER_ARGS=(
-    -d --name "$CONTAINER"
-    --security-opt label=disable
-    --cap-add SYS_PTRACE
-    --ipc host
-    --shm-size "${SHM_SIZE:-16g}"
-    -p "$PORT:$INTERNAL_PORT"
-    --ulimit memlock=-1
-    --ulimit stack=67108864
-  )
-  # 厂商设备直通（动态函数或静态数组；每行一个参数）
-  while IFS= read -r arg; do
-    [[ -n "$arg" ]] && DOCKER_ARGS+=("$arg")
-  done < <(vendor_device_args)
-  # 厂商额外挂载（宿主机路径存在才挂）
-  while IFS= read -r spec; do
-    [[ -n "$spec" ]] && DOCKER_ARGS+=(-v "$spec")
-  done < <(vendor_mounts)
-  # 用户额外挂载（EXTRA_MOUNTS，空格分隔的 host:container[:ro]）
-  if [[ -n "$EXTRA_MOUNTS" ]]; then
-    # shellcheck disable=SC2206
-    for spec in $EXTRA_MOUNTS; do DOCKER_ARGS+=(-v "$spec"); done
-  fi
-  [[ -n "$SRC_DIR" ]] && DOCKER_ARGS+=(-v "$SRC_DIR":/src:ro)
-  DOCKER_ARGS+=(
-    -v "$PROJECT_ROOT":/opt/vllm-probe:ro
-    -v "$RUN_DIR":/logs
-    -v "$TRACE_DIR":/traces
-  )
-  [[ -n "$GAME_DIR" ]] && DOCKER_ARGS+=(-v "$GAME_DIR":"$GAME_DIR")
-  for env in "${ENVS[@]}"; do DOCKER_ARGS+=("$env"); done
-  DOCKER_ARGS+=("$IMAGE" bash -lc "$INNER_CMD > /logs/serve.log 2>&1")
+    for kv in "${ENV_KVS[@]+"${ENV_KVS[@]}"}"; do
+      # K=V 按第一个 = 切分，值用 printf %q 保证含空格/引号也安全
+      printf 'export %s=%q\n' "${kv%%=*}" "${kv#*=}"
+    done
+    printf 'exec %s %s\n' "$SERVE_ENTRYPOINT_ACTUAL" "$(quote_argv "${ARGS[@]}")"
+  } > "$LAUNCHER"
+  chmod +x "$LAUNCHER"
 
   if (( DRY_RUN )); then
     echo
+    echo "# 运行时：host（物理机裸跑，不使用 docker）"
     echo "# 厂商：$VENDOR（$VENDOR_LABEL）"
-    echo "# 容器内实际执行的命令："
-    echo "$INNER_CMD"
+    echo "# 宿主工作目录：$WORKDIR"
+    echo "# 启动脚本：$LAUNCHER"
     echo
-    echo "docker run \\"
-    printf '  %s \\\n' "${DOCKER_ARGS[@]}"
+    echo "===== serve_launch.sh ====="
+    cat "$LAUNCHER"
+    echo "==========================="
+    echo
+    echo "# 实际启动方式："
+    echo "setsid nohup bash $LAUNCHER > $LOG_FILE 2>&1 &"
+    echo
+    echo "# vLLM 实际执行的命令："
+    echo "$CMD_STR"
     exit 0
   fi
 
-  log "docker run 启动容器 $CONTAINER（镜像 $IMAGE）"
-  docker run "${DOCKER_ARGS[@]}" >/dev/null
-  log "容器已启动，日志：$LOG_FILE"
-
-elif [[ "$MODE" == "exec" ]]; then
-  [[ -n "$EXEC_CONTAINER" ]] || die "MODE=exec 需要设置 EXEC_CONTAINER（要复用哪个容器）"
-  container_running "$EXEC_CONTAINER" || die "容器 $EXEC_CONTAINER 未运行"
-  EXEC_LOG_DIR="${EXEC_LOG_DIR:-${GAME_DIR:-/tmp}/vllm-probe}"
-  docker exec "$EXEC_CONTAINER" mkdir -p "$EXEC_LOG_DIR"
-  EXEC_LOG="$EXEC_LOG_DIR/serve-$(date +%H%M%S).log"
-  if (( DRY_RUN )); then
-    echo "# 容器内实际执行的命令："
-    echo "$INNER_CMD > $EXEC_LOG 2>&1"
-    echo
-    echo "docker exec -d ${ENVS[*]:-} $EXEC_CONTAINER bash -lc \"...\""
-    exit 0
+  # 已有 host 实例在跑则拒绝启动（与 docker 的"容器已在运行"对齐）
+  if host_instance_running "$RUN_DIR"; then
+    die "host 实例已在运行（PID=$(host_instance_pid "$RUN_DIR" 2>/dev/null || echo ?)，run dir: $RUN_DIR）；先执行 scripts/stop_vllm.sh --run-dir $RUN_DIR"
   fi
-  log "docker exec -d 在已有容器 $EXEC_CONTAINER 中启动（端口 $PORT 需与该容器映射一致）"
-  docker exec -d "${ENVS[@]+"${ENVS[@]}"}" "$EXEC_CONTAINER" bash -lc "$INNER_CMD > $EXEC_LOG 2>&1"
-  LOG_FILE="$EXEC_LOG"
-  ln -sfn "$LOG_FILE" "$RUN_DIR/serve.log" 2>/dev/null || true
-  log "日志：$LOG_FILE（已软链到 $RUN_DIR/serve.log）"
+
+  # host 预检：宿主依赖检查脚本由 scripts/host_check.sh 提供；不存在则跳过
+  if [[ "${HOST_PRECHECK:-1}" == "1" ]] && (( ! SKIP_CHECK )); then
+    if [[ -f "$SCRIPT_DIR/host_check.sh" ]]; then
+      log "host 预检：bash scripts/host_check.sh --json --outdir $RUN_DIR"
+      if ! bash "$SCRIPT_DIR/host_check.sh" --json --outdir "$RUN_DIR"; then
+        die "物理机预检未通过（产物见 $RUN_DIR）；修复后重试，或用 --skip-check / HOST_PRECHECK=0 跳过"
+      fi
+      ok "host 预检通过"
+    else
+      warn "HOST_PRECHECK=1 但 scripts/host_check.sh 不存在，跳过预检"
+    fi
+  else
+    log "跳过 host 预检（--skip-check 或 HOST_PRECHECK!=1）"
+  fi
+
+  # 端口占用检查：vLLM 自己会 bind $HOST:$PORT，提前失败更友好
+  if ! "$(host_python)" - "$HOST" "$PORT" <<'PY'
+import socket, sys
+
+host, port = sys.argv[1], int(sys.argv[2])
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    sock.bind((host, port))
+except OSError as exc:
+    print(f"端口 {host}:{port} 已被占用：{exc}", file=sys.stderr)
+    sys.exit(1)
+finally:
+    sock.close()
+PY
+  then
+    die "端口 $HOST:$PORT 已被占用；请先停掉占用进程或换一个 PORT（.env 或 PORT=xxxx ...）"
+  fi
+
+  # stat logger 插件装到 run 目录（PYTHONPATH 已在 ENV_KVS 里指向 .probe_plugins）
+  if [[ "$PROBE_PLUGIN" == "1" ]]; then
+    mkdir -p "$RUN_DIR/.probe_plugins"
+    # pip 从 pyproject 源码目录安装时会在源码树里生成 build/ 与 *.egg-info，先记录
+    # 安装前的状态，安装后把「新出现」的清理掉，避免污染 git 工作区。
+    PLUGIN_ARTIFACTS_BEFORE="$(ls -1d "$PROJECT_ROOT"/plugin_probe/build "$PROJECT_ROOT"/plugin_probe/*.egg-info 2>/dev/null || true)"
+    log "安装 stat logger 插件到 $RUN_DIR/.probe_plugins"
+    if "$(host_python)" -m pip install -q --no-deps --no-build-isolation \
+        --target "$RUN_DIR/.probe_plugins" "$PROJECT_ROOT/plugin_probe" >/dev/null 2>&1; then
+      ok "stat logger 插件已安装（$RUN_DIR/.probe_plugins）"
+    else
+      warn "stat logger 插件安装失败（不影响推理，仅缺 JSONL）"
+    fi
+    PLUGIN_ARTIFACTS_AFTER="$(ls -1d "$PROJECT_ROOT"/plugin_probe/build "$PROJECT_ROOT"/plugin_probe/*.egg-info 2>/dev/null || true)"
+    for _art in $PLUGIN_ARTIFACTS_AFTER; do
+      grep -qxF "$_art" <<< "$PLUGIN_ARTIFACTS_BEFORE" || rm -rf "$_art"
+    done
+  fi
+
+  log "host 启动：$LAUNCHER（工作目录 $WORKDIR）"
+  HOST_PID="$(host_start "$RUN_DIR" "$LOG_FILE" "$LAUNCHER")"
+  ok "host 实例已启动：PID=$HOST_PID PGID=$(cat "$RUN_DIR/serve.pgid" 2>/dev/null || echo "$HOST_PID")"
+  log "日志：$LOG_FILE"
 else
-  die "MODE 非法：$MODE（run|exec）"
+  # ---- docker（原有行为）----
+  if [[ "$MODE" == "run" ]]; then
+    if container_exists "$CONTAINER"; then
+      if container_running "$CONTAINER"; then
+        die "容器 $CONTAINER 已在运行；先执行 scripts/stop_vllm.sh，或设置 CONTAINER=其它名字"
+      fi
+      log "移除已退出的同名容器 $CONTAINER"
+      docker rm "$CONTAINER" >/dev/null
+    fi
+
+    DOCKER_ARGS=(
+      -d --name "$CONTAINER"
+      --security-opt label=disable
+      --cap-add SYS_PTRACE
+      --ipc host
+      --shm-size "${SHM_SIZE:-16g}"
+      -p "$PORT:$INTERNAL_PORT"
+      --ulimit memlock=-1
+      --ulimit stack=67108864
+    )
+    # 厂商设备直通（动态函数或静态数组；每行一个参数）
+    while IFS= read -r arg; do
+      [[ -n "$arg" ]] && DOCKER_ARGS+=("$arg")
+    done < <(vendor_device_args)
+    # 厂商额外挂载（宿主机路径存在才挂）
+    while IFS= read -r spec; do
+      [[ -n "$spec" ]] && DOCKER_ARGS+=(-v "$spec")
+    done < <(vendor_mounts)
+    # 用户额外挂载（EXTRA_MOUNTS，空格分隔的 host:container[:ro]）
+    if [[ -n "$EXTRA_MOUNTS" ]]; then
+      # shellcheck disable=SC2206
+      for spec in $EXTRA_MOUNTS; do DOCKER_ARGS+=(-v "$spec"); done
+    fi
+    [[ -n "$SRC_DIR" ]] && DOCKER_ARGS+=(-v "$SRC_DIR":/src:ro)
+    DOCKER_ARGS+=(
+      -v "$PROJECT_ROOT":/opt/vllm-probe:ro
+      -v "$RUN_DIR":/logs
+      -v "$TRACE_DIR":/traces
+    )
+    [[ -n "$GAME_DIR" ]] && DOCKER_ARGS+=(-v "$GAME_DIR":"$GAME_DIR")
+    # 共用的 K=V 在 docker 侧派生成 -e K=V
+    for kv in "${ENV_KVS[@]+"${ENV_KVS[@]}"}"; do DOCKER_ARGS+=(-e "$kv"); done
+    DOCKER_ARGS+=("$IMAGE" bash -lc "$INNER_CMD > /logs/serve.log 2>&1")
+
+    if (( DRY_RUN )); then
+      echo
+      echo "# 厂商：$VENDOR（$VENDOR_LABEL）"
+      echo "# 容器内实际执行的命令："
+      echo "$INNER_CMD"
+      echo
+      echo "docker run \\"
+      printf '  %s \\\n' "${DOCKER_ARGS[@]}"
+      exit 0
+    fi
+
+    log "docker run 启动容器 $CONTAINER（镜像 $IMAGE）"
+    docker run "${DOCKER_ARGS[@]}" >/dev/null
+    log "容器已启动，日志：$LOG_FILE"
+
+  elif [[ "$MODE" == "exec" ]]; then
+    [[ -n "$EXEC_CONTAINER" ]] || die "MODE=exec 需要设置 EXEC_CONTAINER（要复用哪个容器）"
+    container_running "$EXEC_CONTAINER" || die "容器 $EXEC_CONTAINER 未运行"
+    EXEC_LOG_DIR="${EXEC_LOG_DIR:-${GAME_DIR:-/tmp}/vllm-probe}"
+    docker exec "$EXEC_CONTAINER" mkdir -p "$EXEC_LOG_DIR"
+    EXEC_LOG="$EXEC_LOG_DIR/serve-$(date +%H%M%S).log"
+    DOCKER_EXEC_ENV_ARGS=()
+    for kv in "${ENV_KVS[@]+"${ENV_KVS[@]}"}"; do DOCKER_EXEC_ENV_ARGS+=(-e "$kv"); done
+    if (( DRY_RUN )); then
+      echo "# 容器内实际执行的命令："
+      echo "$INNER_CMD > $EXEC_LOG 2>&1"
+      echo
+      echo "docker exec -d ${DOCKER_EXEC_ENV_ARGS[*]:-} $EXEC_CONTAINER bash -lc \"...\""
+      exit 0
+    fi
+    log "docker exec -d 在已有容器 $EXEC_CONTAINER 中启动（端口 $PORT 需与该容器映射一致）"
+    docker exec -d "${DOCKER_EXEC_ENV_ARGS[@]+"${DOCKER_EXEC_ENV_ARGS[@]}"}" "$EXEC_CONTAINER" bash -lc "$INNER_CMD > $EXEC_LOG 2>&1"
+    LOG_FILE="$EXEC_LOG"
+    ln -sfn "$LOG_FILE" "$RUN_DIR/serve.log" 2>/dev/null || true
+    log "日志：$LOG_FILE（已软链到 $RUN_DIR/serve.log）"
+  else
+    die "MODE 非法：$MODE（run|exec）"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
 # 6. 等待就绪
 # ---------------------------------------------------------------------------
 if (( FOREGROUND )); then
-  log "前台跟踪日志（Ctrl-C 结束跟踪，容器继续运行）"
+  log "前台跟踪日志（Ctrl-C 结束跟踪，实例继续运行）"
   tail -f "$LOG_FILE"
   exit 0
 fi
