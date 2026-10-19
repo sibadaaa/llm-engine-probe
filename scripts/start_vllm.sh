@@ -305,28 +305,11 @@ PRELUDE="$(vendor_prelude_shell)"
 INNER_CMD="cd $INNER_WORKDIR && ${PRELUDE}export PYTHONPATH=$(container_pythonpath); ${PLUGIN_SETUP}exec $CMD_STR"
 
 # host 模式的版本信息（best-effort；装不了 vllm/torch 时对应字段为 null）
+# 注意：必须在与 serve_launch.sh 相同的环境里采集（先 source HOST_PRELUDE_FILES、
+# 再注入 host PYTHONPATH），否则在需要 DTK/Ascend prelude 的机器上会永远拿到 null。
 HOST_META_JSON=""
 if runtime_is_host; then
-  HOST_META_JSON="$(HOST_PY_NAME="$(host_python)" "$(host_python)" - <<'PY' 2>/dev/null || true
-import json, os, platform, socket
-
-def _ver(mod):
-    try:
-        m = __import__(mod)
-        return getattr(m, "__version__", None)
-    except Exception:
-        return None
-
-print(json.dumps({
-    "python": os.environ.get("HOST_PY_NAME") or None,
-    "python_version": platform.python_version(),
-    "vllm_version": _ver("vllm"),
-    "torch_version": _ver("torch"),
-    "hostname": socket.gethostname(),
-    "kernel": platform.release(),
-}, ensure_ascii=False))
-PY
-)"
+  HOST_META_JSON="$(host_meta_json)"
   [[ -n "$HOST_META_JSON" ]] || HOST_META_JSON='{"python": null, "python_version": null, "vllm_version": null, "torch_version": null, "hostname": null, "kernel": null}'
 fi
 

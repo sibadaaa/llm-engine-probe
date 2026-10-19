@@ -9,8 +9,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -201,6 +203,104 @@ class MetricsParserTests(unittest.TestCase):
         diff = diff_snapshots(self.snap, later, 10.0)
         self.assertAlmostEqual(diff["counters"]["vllm:prompt_tokens_total"], 1000.0)
         self.assertAlmostEqual(diff["rates"]["vllm:prompt_tokens_total"], 100.0)
+
+    def test_diff_histogram_units(self) -> None:
+        """只有 *_seconds 直方图换算 ms；token 类必须按原值（不能用 709000.0 ms）。"""
+        before = parse_metrics_text(
+            "\n".join(
+                [
+                    "# TYPE vllm:request_prompt_tokens histogram",
+                    'vllm:request_prompt_tokens_bucket{le="+Inf"} 1',
+                    "vllm:request_prompt_tokens_sum 100",
+                    "vllm:request_prompt_tokens_count 1",
+                    "# TYPE vllm:e2e_request_latency_seconds histogram",
+                    'vllm:e2e_request_latency_seconds_bucket{le="+Inf"} 1',
+                    "vllm:e2e_request_latency_seconds_sum 0.5",
+                    "vllm:e2e_request_latency_seconds_count 1",
+                ]
+            )
+        )
+        after = parse_metrics_text(
+            "\n".join(
+                [
+                    "# TYPE vllm:request_prompt_tokens histogram",
+                    'vllm:request_prompt_tokens_bucket{le="+Inf"} 3',
+                    "vllm:request_prompt_tokens_sum 300",
+                    "vllm:request_prompt_tokens_count 3",
+                    "# TYPE vllm:e2e_request_latency_seconds histogram",
+                    'vllm:e2e_request_latency_seconds_bucket{le="+Inf"} 3',
+                    "vllm:e2e_request_latency_seconds_sum 1.5",
+                    "vllm:e2e_request_latency_seconds_count 3",
+                ]
+            )
+        )
+        diff = diff_snapshots(before, after, 1.0)
+        tokens = diff["histograms"]["vllm:request_prompt_tokens"]
+        self.assertEqual(tokens["unit"], "tokens")
+        self.assertAlmostEqual(tokens["mean"], 100.0)
+        self.assertIsNone(tokens["mean_ms"])
+        seconds = diff["histograms"]["vllm:e2e_request_latency_seconds"]
+        self.assertEqual(seconds["unit"], "s")
+        self.assertAlmostEqual(seconds["mean_ms"], 500.0)
+
+    def test_metrics_diff_print_handles_token_histograms(self) -> None:
+        """回归：token 直方图 mean_ms=None，`probe metrics --diff --print` 不能按 ms 格式化。
+
+        scripts/collect_metrics.sh 的 --diff 路径固定带 --print，曾因 TypeError 中断。
+        """
+        before = parse_metrics_text(
+            "\n".join(
+                [
+                    "# TYPE vllm:request_prompt_tokens histogram",
+                    'vllm:request_prompt_tokens_bucket{le="+Inf"} 1',
+                    "vllm:request_prompt_tokens_sum 100",
+                    "vllm:request_prompt_tokens_count 1",
+                ]
+            )
+        )
+        after = parse_metrics_text(
+            "\n".join(
+                [
+                    "# TYPE vllm:request_prompt_tokens histogram",
+                    'vllm:request_prompt_tokens_bucket{le="+Inf"} 3',
+                    "vllm:request_prompt_tokens_sum 300",
+                    "vllm:request_prompt_tokens_count 3",
+                ]
+            )
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            before_path = Path(tmp) / "before.json"
+            after_path = Path(tmp) / "after.json"
+            before.save(before_path)
+            after.save(after_path)
+            env = dict(os.environ)
+            env["PYTHONPATH"] = str(ROOT) + (
+                os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
+            )
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "probe",
+                    "metrics",
+                    "--diff",
+                    str(before_path),
+                    str(after_path),
+                    "--elapsed",
+                    "1",
+                    "--print",
+                    "--outdir",
+                    tmp,
+                ],
+                cwd=str(ROOT),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("tokens", proc.stdout)
+            self.assertNotIn("Traceback", proc.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -551,6 +651,87 @@ class DocsConsistencyTests(unittest.TestCase):
                 )
                 checked += 1
         self.assertGreater(checked, 0, "应该至少校验到一个 histogram_quantile 查询")
+
+
+class ConfigSafetyTests(unittest.TestCase):
+    """产物里不能出现明文 API key。"""
+
+    def test_api_key_masked_in_dump(self) -> None:
+        raw = "sk-secret-1234567890"
+        cfg = ProbeConfig(api_key=raw)
+        data = cfg.dump()
+        self.assertNotEqual(data["api_key"], raw)
+        self.assertNotIn(raw, json.dumps(data))
+        # 打码后仍可辨识（前 4 + 后 4），且配置对象本身仍保留原值供请求使用
+        self.assertTrue(data["api_key"].startswith("sk-s"))
+        self.assertTrue(data["api_key"].endswith("7890"))
+        self.assertEqual(cfg.api_key, raw)
+
+    def test_empty_api_key_kept(self) -> None:
+        self.assertEqual(ProbeConfig(api_key="EMPTY").dump()["api_key"], "EMPTY")
+
+    def test_auth_headers(self) -> None:
+        self.assertEqual(ProbeConfig(api_key="EMPTY").auth_headers(), {})
+        self.assertEqual(
+            ProbeConfig(api_key="sk-abc").auth_headers(),
+            {"Authorization": "Bearer sk-abc"},
+        )
+
+
+class ReportExternalLogTests(unittest.TestCase):
+    """外部启动实例：RUN_DIR 没有 serve.log 时回退读 run_meta["serve_log"]。"""
+
+    def test_meta_serve_log_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            external_log = run / "external-serve.log"
+            external_log.write_text("hello\n", encoding="utf-8")
+            (run / "run_meta.json").write_text(
+                json.dumps(
+                    {"runtime": "host", "model": "m", "serve_log": str(external_log)},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            art = Artifacts.scan(run)
+            self.assertEqual(art.serve_log, external_log)
+
+    def test_report_histogram_units_markdown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            (run / "metrics_after.json").write_text(
+                json.dumps({"families": {}}), encoding="utf-8"
+            )
+            (run / "metrics_diff.json").write_text(
+                json.dumps(
+                    {
+                        "elapsed_s": 18.0,
+                        "counters": {},
+                        "rates": {},
+                        "histograms": {
+                            "vllm:request_prompt_tokens": {
+                                "count": 4,
+                                "unit": "tokens",
+                                "mean": 709.0,
+                                "mean_ms": None,
+                            },
+                            "vllm:e2e_request_latency_seconds": {
+                                "count": 4,
+                                "unit": "s",
+                                "mean": 4.5038,
+                                "mean_ms": 4503.8,
+                            },
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            text = build_report(run)
+            self.assertIn("709.0 tokens", text)
+            self.assertIn("4503.8 ms", text)
+            self.assertIn("均值", text)
+            self.assertNotIn("709000.0", text)
 
 
 if __name__ == "__main__":

@@ -65,6 +65,8 @@ cp .env.example .env
 #   RUNTIME=host
 #   HOST_PYTHON=/path/to/venv/bin/python
 #   MODEL=/宿主机上的模型目录
+#   （厂商环境脚本：HOST_PRELUDE_FILES 支持 `K=V` export + 文件路径 source，按顺序执行；
+#     例：HOST_PRELUDE_FILES="DTK_ROOT=/mnt/game/host-runtime/dtk2604 /home/lyh/z100-vllm/tools/dcu/env.sh"）
 
 # ② 预检：Python/vLLM 导入、GPU 与驱动、厂商 prelude、模型/端口、系统限制
 make host-check
@@ -92,6 +94,9 @@ make compare A=runs/<docker>/suite_results.json B=runs/<host>/suite_results.json
 
 > 物理机模式**不需要**镜像、容器、`docker-compose` 观测栈，也**不需要改** `probe/` 工具包或 `vendors/` 适配层；
 > 设备可见性环境变量与厂商 prelude 仍然生效，只有 Docker 设备直通参数被忽略。
+> prelude 支持两类 token：`K=V` 先 export、路径再 source（顺序有意义）；
+> `make host-check`、`status` 的 import/版本探测与启动前的版本探测都在同一套（prelude + host `PYTHONPATH`）
+> 环境里执行，不会因为没 source 厂商脚本而假失败。
 
 > 🕒 **停止行为**：`make down-host` 停止后默认会轮询本机 SMI、等显存回落（最长约 60s，本机还有其它显存占用时可能等满）。
 > 同机还有其它任务、或只是调试假实例时，可用 `PROBE_SKIP_VRAM_WAIT=1 make down-host` 跳过（等价
@@ -216,6 +221,8 @@ make up-kernel
 > （`CUDA_VISIBLE_DEVICES` / `HIP_VISIBLE_DEVICES` / `ASCEND_RT_VISIBLE_DEVICES` / `ZE_AFFINITY_MASK`）和
 > **厂商 prelude 环境脚本**（DTK / `set_env.sh`）仍会注入到本机 vLLM 进程；只有 Docker 专属的
 > **设备直通参数**（`--device` / `--gpus` / `--group-add`）被忽略——设备可见性由宿主机驱动与用户权限决定。
+> host 模式用 `HOST_PRELUDE_FILES` 配置 prelude：空格分隔的 token 按顺序执行，`K=V` → export、
+> 其它路径 → 存在则 source（例如先 `DTK_ROOT=…` 再 source 依赖它的 `env.sh`）。
 
 ### 每层的厂商适配点
 
@@ -256,6 +263,11 @@ RUNTIME=host scripts/start_vllm.sh --host --level steps
 > 全部自动走物理机模式；只想临时切一次时用 `make up RUNTIME=host`，或直接用 `make up-host`
 > 等 `*-host` 目标（它们显式带 `--host`，不依赖 `.env`）。
 
+> 未显式给 `RUN_DIR` / `--run-dir` 时，`status` / `probe_all` / `run_suite` 按目录 **mtime** 选最新运行目录
+> （不再是目录名字符串排序）；要对某次运行补报告或做探测时，建议显式指定 `--run-dir`。
+> `status` 对"不是本工具启动"的实例会显示「外部实例（非本工具启动）」；`/start_profile` 探活是只读 `GET`；
+> 若实例带 `--api-key` 启动，设 `VLLM_API_KEY` 后 `/v1/models`、`/metrics` 的端点检查会带 `Authorization`。
+
 ### Makefile
 
 ```bash
@@ -292,22 +304,24 @@ make compose-up  # 用 compose 起容器壳（VENDOR 自动探测，可覆盖）
 ```bash
 VENDOR=nvidia scripts/start_vllm.sh --dry-run   # 查看某厂商将执行的 docker 命令
 scripts/start_vllm.sh [--level steps|deep|kernel] [--dry-run] [--exec]
-scripts/stop_vllm.sh  [--rm] [--kill-exec]
-scripts/status.sh ; scripts/wait_ready.sh
+scripts/stop_vllm.sh  [--rm] [--kill-exec] [--run-dir DIR] [--runtime docker|host]
+scripts/status.sh [--port 8100] [--run-dir DIR] [--runtime docker|host] ; scripts/wait_ready.sh
 scripts/collect_metrics.sh [--tag before] [--diff a.json b.json --elapsed 60] [--watch 5]
 scripts/probe_http.sh  [--prompt-tokens 4096 --max-tokens 128 --concurrency 8 --repeat 3]
 scripts/watch_steps.sh [--summary | --tail 2000 | --docker]
 scripts/trace_capture.sh [--analyze-only | --skip-load]
 scripts/pyspy.sh --mode dump|flame|top [--duration 30]
 scripts/gpu_sample.sh --duration 60
-scripts/run_suite.sh [--scenarios s02,s05 | --list]
-scripts/probe_all.sh [--with-gpu-sample] [--with-pyspy] [--skip-trace]
+scripts/run_suite.sh [--scenarios s02,s05 | --list] [--runtime docker|host]
+scripts/probe_all.sh [--with-gpu-sample] [--with-pyspy] [--skip-trace] [--runtime docker|host] [--log-file PATH]
 scripts/report.sh [--open]
 
 # 物理机模式（同样的脚本 + RUNTIME=host；start 也可用 --host）
 RUNTIME=host scripts/start_vllm.sh [--host] [--level steps|deep|kernel] [--dry-run] [--skip-check]
 RUNTIME=host scripts/stop_vllm.sh [--run-dir runs/<时间戳>]
-RUNTIME=host scripts/status.sh [--port 8100]
+RUNTIME=host scripts/status.sh [--port 8100] [--run-dir runs/<时间戳>]
+RUNTIME=host scripts/run_suite.sh --runtime host [--port 8100] [--run-dir runs/<时间戳>]
+RUNTIME=host scripts/probe_all.sh --runtime host [--port 8100] [--log-file /path/to/serve.log]
 RUNTIME=host scripts/pyspy.sh --mode dump|flame [--duration 30]
 bash scripts/host_check.sh [--json] [--quick] [--start]   # 物理机环境预检
 ```
@@ -396,6 +410,12 @@ scripts/probe_http.sh --shared-prefix-tokens 2048 --repeat 5
 
 产物：`http_requests.jsonl`（逐请求）、`http_summary.json`（分位数）、探测前后的 `metrics_before/after.json` 与 `metrics_diff.json`。
 
+> 实例带 `--api-key` 启动时，在 `.env` 里设 `VLLM_API_KEY`：请求级探测、`probe env` 的基础端点检查、
+> `status` 的 `/v1/models` `/metrics` 检查都会自动带 `Authorization: Bearer …`。**探测产物**
+> （`http_summary.json` 等）里的 `api_key` 会打码（形如 `sk-z***310f`），不会明文落盘；
+> 启动类产物（`cmd.txt`/`args.txt`/`run_meta.json` 的 `command`、`serve_launch.sh`）按启动命令原样记录，
+> 若启动参数里含 `--api-key`，请自行保护运行目录权限（`chmod 700`）。
+
 ### 6.2 指标层：`scripts/collect_metrics.sh`
 
 ```bash
@@ -421,6 +441,10 @@ scripts/collect_metrics.sh --diff runs/x/metrics_before.json runs/x/metrics_afte
 > **为什么会出现 `≤`**：本部署的 `vllm:request_queue_time_seconds` 桶阶梯从 `le=0.3` 起步，
 > 而队列时间普遍只有几毫秒 ⇒ 所有观测都落进第一个桶，插值出来的"p50=150ms"是假精度。
 > 工具箱会如实标成 `≤300`，并建议改看**服务端逐请求**的 `queue_time_ms`（那是精确值）。
+
+> **直方图单位**：只有 `*_seconds` 类直方图换算成 ms；token 数类直方图（如 prompt/generation tokens）
+> 按 tokens 显示，「均值」列会带单位（如 `123 tokens`）——不会再把 token 数误标成毫秒
+> （旧版本出现过 `709000.0 ms` 这种数字）。
 
 ### 6.3 step 级：`scripts/watch_steps.sh`
 
@@ -612,11 +636,11 @@ llm_engine step: get_output / process_outputs / record_stats / abort_requests
 
 | 文件 | 内容 |
 |---|---|
-| `run_meta.json` | 本次运行的运行方式（`runtime` 为 docker 或 host）/镜像或本机环境/模型/并行度/观测档位/完整启动命令；host 模式另有 `host` 段（python、python_version、vllm_version、torch_version、hostname、kernel） |
+| `run_meta.json` | 本次运行的运行方式（`runtime` 为 docker 或 host）/厂商（`vendor`/`vendor_label`）/镜像或本机环境/模型/并行度/观测档位/完整启动命令；host 模式另有 `host` 段（python、python_version、vllm_version、torch_version、hostname、kernel）。未经过 `start_vllm.sh` 的外部实例由脚本自动补一份最小 run_meta；若用了 `--log-file` / `PROBE_LOG_FILE`，外部日志路径记录在 `serve_log` |
+| `serve.log` | 引擎完整日志（逐 step 明细、stats、投机解码、MFU、图统计）；外部实例的日志会被复制到这里，缺失时 `report` 回退读 `run_meta["serve_log"]` |
 | `cmd.txt`、`args.txt` | 可复现的命令行（直接拷贝即可重跑） |
 | `serve.pid`、`serve.pgid`（host） | 本机 vLLM 进程 PID / 进程组 ID（stop 时按组清理；Docker 模式无此文件） |
 | `serve_launch.sh`（host） | 实际执行的启动脚本（含厂商 prelude、环境变量与完整命令，可直接复现） |
-| `serve.log` | 引擎完整日志（逐 step 明细、stats、投机解码、MFU、图统计） |
 | `env_check.json` | 观测开关自检结果 |
 | `http_requests.jsonl` / `http_summary.json` | 逐请求明细 / 分位数汇总 |
 | `metrics_before.json` `metrics_after.json` `metrics_diff.json` | 指标快照与差分（含 `.tsv`） |
@@ -674,7 +698,8 @@ time_in_model_decode`、`gen_ai.usage.prompt_tokens / completion_tokens`、`gen_
 **默认姿态：另起一个探测实例（:8100），不要碰现网 :8000。**
 27B/TP4 的显存占用很高，两个实例同时在 4 张卡上跑会互相挤兑，探测数据也会失真。
 
-如果你确实想探测**已经在跑的**实例（例如 `z100-vllm`），有两种无重启方式：
+如果你确实想探测**已经在跑的**实例（例如 `z100-vllm` 或 systemd 启动的 host 实例），
+有以下无重启方式（都只做只读采集/推理请求，不改实例配置）：
 
 ```bash
 # 方式 A：只读探测（完全不动服务），采集指标 + 解析现有日志
@@ -683,7 +708,33 @@ python3 -m probe logs --file /mnt/game/dflash/serve-perf.log --summary runs/live
 
 # 方式 B：用 probe_all 对现有实例做一轮（会发推理请求，注意会污染正在做的 A/B 实验）
 RUN_DIR=runs/live bash scripts/probe_all.sh --port 8000 --skip-trace
+
+# 方式 C：实例不是本工具启动的（systemd/手工/其它脚本），显式标注运行方式 + 外部日志
+RUNTIME=host RUN_DIR=runs/live-host \
+  bash scripts/probe_all.sh --runtime host --port 8000 \
+  --log-file /var/log/vllm/serve.log --skip-trace
 ```
+
+几个关键点：
+
+* **`--runtime docker|host`**：显式告诉脚本实例跑在容器还是物理机；不写时按 `.env` 的 `RUNTIME`
+  （默认 docker）。`.env` 不是 host 却要探测 host 实例时，一定要加 `--runtime host`，否则报告/套件
+  会把运行方式标错。
+* **`--log-file PATH`（或 `.env` 的 `PROBE_LOG_FILE`）**：实例日志不在 `<RUN_DIR>/serve.log` 时用它。
+  `probe_all.sh` 会把外部日志复制为 `<RUN_DIR>/serve.log` 再做 step 级解析；`run_meta.json` 的
+  `serve_log` 也会记录它，`report` 在 `serve.log` 不存在时回退读取。
+* **显式 `RUN_DIR=`**：不指定时按目录 mtime 选最新运行目录（不再是目录名字符串排序）。给外部实例
+  单独一个 `RUN_DIR`，避免和之前的运行混在一起。
+* **`VLLM_API_KEY`**：实例带 `--api-key` 启动时，在 `.env` 里设同名变量（或导出到环境）；
+  `probe` / `status` 的端点与请求探测会自动带 `Authorization: Bearer …`。探测产物里的 `api_key`
+  会打码（形如 `sk-z***310f`）；启动类产物按启动命令原样记录（见 §6.1 说明）。
+* **自动补 run_meta**：没经过 `start_vllm.sh` 的实例会被自动补一份最小 `run_meta.json`，包含
+  `runtime`、`host{...}`、`vendor`/`vendor_label` 等，所以 `--runtime host` 下报告开头会正确显示
+  「物理机（host）」，`suite_results.json` 的 `engine` 段也会带 `runtime`/`host`。
+* **step 级观测**：外部启动脚本若没开 iteration 明细，报告第 3 节会是空的；这类脚本（不在本仓库）
+  支持 `ITER_DETAILS=1` 时可用它打开 `--enable-logging-iteration-details`。
+* 外部实例不是 `start_vllm.sh` 启动的，没有 `serve.pid`：`make down-host` 不会停它（`status` 会显示
+  「外部实例（非本工具启动）」），请用实例自己的方式停止。
 
 如果要复用现网容器启动方式（`docker exec` 而不是新建容器）：
 
@@ -755,9 +806,14 @@ make gpu-sample                 # 采样各卡 VRAM%（或直接用本机 SMI：
 
 **Q12：host 模式启动时报 `import vllm` / `import torch` 失败或版本不对？**
 先确认 `HOST_PYTHON` 指向的**就是**装了 vLLM 的那个解释器（venv/conda 常见错误是 `python3` 指到系统 Python）；
-再确认厂商环境已 source（hygon 的 DTK、Ascend 的 `set_env.sh`）——host 模式要把这些路径写进
-`HOST_PRELUDE_FILES`。`make host-check` 会逐项检查；实际版本记录在 `run_meta.json` 的 `host` 段，
-和 Docker 模式对比前请先对齐。
+再确认厂商环境已 source（hygon 的 DTK、Ascend 的 `set_env.sh`）——host 模式把这些写进
+`HOST_PRELUDE_FILES`：空格分隔、按顺序执行，`K=V` 先 export，再 source 依赖它的脚本，
+例如 `HOST_PRELUDE_FILES="DTK_ROOT=/mnt/game/host-runtime/dtk2604 …/env.sh"`。
+
+`make host-check` / `status` 的 import 与版本探测、以及 `start_vllm.sh` 写 `run_meta.json` 的 host 版本探测，
+现在都在「按顺序应用 prelude + 叠加 host `PYTHONPATH`（`SRC_DIR` + 项目根 + `TRITON_INSTALL_DIR`）」的环境里执行，
+与实际 `serve_launch.sh` 一致——prelude 配好后这些检查不会再假失败。实际版本记录在
+`run_meta.json` 的 `host` 段，和 Docker 模式对比前请先对齐。
 
 **Q13：host 模式 py-spy 还是报权限错误？**
 容器模式靠 `--cap-add SYS_PTRACE`；物理机模式直接对本机 PID 采样，但 Linux 的 yama 限制仍可能拦截：
@@ -769,6 +825,11 @@ py-spy 不在 `PATH` 时用 `.env` 的 `PYSPY_BIN` 指定。
 和 Docker 模式同一套约定：默认 `PORT=8100` 避开现网 8000；先 `make status-host` 看端点状态，
 `ss -ltnp | grep 8100` 找占用进程，或换 `PORT`。物理机上两个实例同时驻留同一组卡同样会互相挤兑显存，
 **一次只跑一个探测实例**，并用 `make gpu-sample`（或本机 SMI）确认显存已回落。
+
+**Q15：`make status-host` 显示「外部实例（非本工具启动）」？**
+说明本机有 vLLM 进程，但不是用 `start_vllm.sh` 起的（没有 `serve.pid`）。这是正常提示：
+用 `scripts/probe_all.sh --runtime host --log-file …` 对它做只读探测（见 §9），
+`make down-host` 不会停它，请用 systemd 或原启动方式停止；`--kill-exec` 才会按进程名整机清理（谨慎）。
 
 ---
 
@@ -785,7 +846,9 @@ make test          # = bash tests/run_tests.sh
    **文档/看板 ↔ 真实指标名一致性守卫**（防止引用不存在的指标导致面板静默空白）、
    插件记录抽取（鸭子类型假对象，验证"字段改名只丢该项、不抛异常"）、
    **厂商注册表一致性守卫**（Shell `vendors/*.sh` ↔ Python `probe/vendors.py`）、
-   **五家 SMI 输出解析**（`samples/smi/` 样例文本）、标准化套件 schema。
+   **五家 SMI 输出解析**（`samples/smi/` 样例文本）、标准化套件 schema、
+   直方图单位（只有 `*_seconds` 换算 ms，token 类保持 tokens）、探测产物里的 API key 打码、
+   外部实例日志回退（`run_meta["serve_log"]`）。
 2. **脚本语法检查**：全部 `scripts/*.sh`、`vendors/*.sh` 与自测脚本过 `bash -n`。
 3. **mock 端到端**：起一个 mock vLLM（含 `/metrics`、SSE 流式、`/start_profile`），
    跑通 `env → vendor → metrics → http → telemetry → diff → trace_capture → logs → plugin → suite → compare → probe_all → REPORT.md` 全链路。
@@ -793,7 +856,8 @@ make test          # = bash tests/run_tests.sh
    （`python3 -c 'import time;time.sleep(120)'`）校验 `RUNTIME=host` 的 `start --dry-run` 输出
    （含 host/exec、不含 `docker run`）、真实起停（`serve.pid`/`serve.pgid`/`serve_launch.sh`/`cmd.txt`/`traces/`）、
    `status` 显示「运行方式」、`host_check.sh --json` 产出 JSON（存在时）、
-   `watch_steps.sh --docker` 在 host 下明确拒绝。
+   `watch_steps.sh --docker` 在 host 下明确拒绝，
+   以及公共辅助的 `K=V` prelude 解析、`host_exec` 注入环境、`latest_run_dir` 按目录 mtime 选择。
 
 插件还有一层**只在容器内可跑**的自检（验证 entry point 能被 vLLM 加载器发现、
 字段与当前版本一致，见 §6.7 的命令）——本机已实测 18/18 项通过。

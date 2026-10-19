@@ -448,5 +448,67 @@ class ShellWrapperTests(HostCheckTestBase):
         self.assertEqual(payload["host_python"], str(fake))
 
 
+# 假 HOST_PYTHON：只有 prelude 注入的环境变量 PRELUDE_MARK=ok 时才会输出合法探针 JSON。
+# 用来验证 hostcheck 的 import 探针确实在「source 过 HOST_PRELUDE_FILES」的环境里执行。
+PRELUDE_MARKER_PY = r"""#!/usr/bin/env bash
+set -u
+if [[ "${PRELUDE_MARK:-}" != "ok" ]]; then
+  printf 'prelude marker missing\n' >&2
+  exit 7
+fi
+printf '__HOSTCHECK_PYINFO__{"executable":"%s","version":"3.11.0","version_info":[3,11,0],"platform":"Linux-fake","machine":"x86_64","torch":"2.6.0","torch_error":null,"cuda_available":true,"hip":null,"device_count":4,"npu_available":null,"vllm":"0.18.0","vllm_error":null}\n' "$0"
+"""
+
+
+class PreludeEnvTests(HostCheckTestBase):
+    """HOST_PRELUDE_FILES 必须真正作用于 import 探针（K=V 与文件两种写法）。"""
+
+    def _marker_python(self) -> Path:
+        path = self.tmp / "prelude-marker-python"
+        path.write_text(PRELUDE_MARKER_PY, encoding="utf-8")
+        path.chmod(0o755)
+        return path
+
+    def test_kv_prelude_applied_to_import_probe(self) -> None:
+        fake = self._marker_python()
+        proc, payload, _ = self.run_json(
+            *self.base_args(fake),
+            env_extra={"HOST_PRELUDE_FILES": "PRELUDE_MARK=ok"},
+        )
+        checks = self.checks_by_id(payload)
+        self.assertTrue(checks["vllm"]["ok"], checks["vllm"])
+        self.assertTrue(checks["torch"]["ok"], checks["torch"])
+        self.assertEqual(payload["versions"]["vllm"], "0.18.0")
+        self.assertEqual(payload["versions"]["torch"], "2.6.0")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("1 个环境变量", checks["prelude"]["detail"])
+
+    def test_prelude_file_applied_to_import_probe(self) -> None:
+        fake = self._marker_python()
+        prelude = self.tmp / "prelude.sh"
+        prelude.write_text("export PRELUDE_MARK=ok\n", encoding="utf-8")
+        proc, payload, _ = self.run_json(
+            *self.base_args(fake),
+            env_extra={"HOST_PRELUDE_FILES": str(prelude)},
+        )
+        checks = self.checks_by_id(payload)
+        self.assertTrue(checks["vllm"]["ok"], checks["vllm"])
+        self.assertTrue(checks["torch"]["ok"], checks["torch"])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_missing_prelude_file_is_warn_and_import_fails(self) -> None:
+        fake = self._marker_python()
+        proc, payload, _ = self.run_json(
+            *self.base_args(fake),
+            env_extra={"HOST_PRELUDE_FILES": str(self.tmp / "missing-prelude.sh")},
+        )
+        checks = self.checks_by_id(payload)
+        self.assertFalse(checks["prelude"]["ok"])
+        self.assertEqual(checks["prelude"]["level"], "warn")
+        # 环境没生效 → 假解释器拒绝输出 JSON → import 失败是 fail 级
+        self.assertFalse(checks["vllm"]["ok"])
+        self.assertEqual(proc.returncode, 1)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main(verbosity=2)

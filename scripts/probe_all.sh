@@ -7,6 +7,8 @@
 #   scripts/probe_all.sh --with-gpu-sample      # 请求级探测期间同时采样 GPU 遥测（各厂商 SMI）
 #   scripts/probe_all.sh --with-pyspy           # 结束后抓一份 py-spy 栈快照
 #   scripts/probe_all.sh --run-dir /path/to/run # 复用已有运行目录
+#   scripts/probe_all.sh --runtime host         # 声明实例运行方式（外部实例报告不再误标 docker）
+#   scripts/probe_all.sh --log-file /path/log   # 外部启动实例的日志（复制为 RUN_DIR/serve.log 做 step 解析）
 #
 # 建议：先 scripts/start_vllm.sh，再本脚本；最后看 <RUN_DIR>/REPORT.md。
 
@@ -21,6 +23,7 @@ SKIP_LOGS=0
 WITH_GPU_SAMPLE=0
 WITH_PYSPY=0
 WITH_ENV=1
+LOG_FILE="${PROBE_LOG_FILE:-}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --skip-http) SKIP_HTTP=1; shift ;;
@@ -31,12 +34,18 @@ while [[ $# -gt 0 ]]; do
     --no-env) WITH_ENV=0; shift ;;
     --run-dir) RUN_DIR="${2:?}"; shift 2 ;;
     --port) PORT="${2:?}"; shift 2 ;;
+    --runtime)
+      RUNTIME="$(runtime_normalize "${2:?}")"
+      export RUNTIME
+      shift 2
+      ;;
+    --log-file) LOG_FILE="${2:?}"; shift 2 ;;
     --prompt-tokens) PROMPT_TOKENS="${2:?}"; shift 2 ;;
     --max-tokens) MAX_TOKENS="${2:?}"; shift 2 ;;
     --concurrency) CONCURRENCY="${2:?}"; shift 2 ;;
     --repeat) REPEAT="${2:?}"; shift 2 ;;
     --level) PROBE_LEVEL="${2:?}"; shift 2 ;;
-    -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
     *) die "未知参数：$1" ;;
   esac
 done
@@ -47,45 +56,38 @@ if ! RUN_DIR="$(latest_run_dir 2>/dev/null)"; then
 fi
 mkdir -p "$RUN_DIR"
 
-# 如果是直接对"已在运行的实例"做探测（没经过 start_vllm.sh），补一份最小 run_meta.json，
-# 这样报告的开头不会是一片"—"。
-if [[ ! -f "$RUN_DIR/run_meta.json" ]]; then
-  RUNTIME_VALUE="${RUNTIME:-docker}"
-  HOST_PYTHON_VALUE=""
-  if runtime_is_host; then
-    HOST_PYTHON_VALUE="$(host_python 2>/dev/null || echo python3)"
+# CLI --log-file 与 .env 的 PROBE_LOG_FILE 等价：都记进 run_meta["serve_log"]，
+# report 在 RUN_DIR/serve.log 不存在时也能回退读到外部日志。
+if [[ -n "$LOG_FILE" ]]; then
+  PROBE_LOG_FILE="$LOG_FILE"
+  export PROBE_LOG_FILE
+fi
+
+# 直接对"已在运行的实例"做探测（没经过 start_vllm.sh）时补一份最小 run_meta.json：
+# 含 runtime / host 环境 / 厂商，避免报告把裸机实例误标成容器、版本一栏全是 "—"。
+write_minimal_run_meta "$RUN_DIR"
+
+# 外部启动实例：把它的日志复制成 RUN_DIR/serve.log，后面 step 级解析/报告都能直接用。
+if [[ -n "$LOG_FILE" ]]; then
+  if [[ ! -f "$LOG_FILE" ]]; then
+    warn "指定的日志文件不存在，跳过 step 级日志接入：$LOG_FILE"
+  elif [[ ! "$RUN_DIR/serve.log" -ef "$LOG_FILE" ]]; then
+    cp -f "$LOG_FILE" "$RUN_DIR/serve.log"
+    log "已接入外部实例日志：$LOG_FILE → $RUN_DIR/serve.log（$(wc -l < "$RUN_DIR/serve.log") 行）"
   fi
-  RUN_META_DIR="$RUN_DIR" PORT="$PORT" PROBE_LEVEL="$PROBE_LEVEL" \
-  RUNTIME_VALUE="$RUNTIME_VALUE" HOST_PYTHON_VALUE="$HOST_PYTHON_VALUE" py - <<'PY'
-import json, os, time
-runtime = os.environ.get("RUNTIME_VALUE") or "docker"
-meta = {
-    "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-    "runtime": runtime,
-    # host 模式没有容器/镜像，保持与 start_vllm.sh 的 run_meta 契约一致
-    "container": "" if runtime == "host" else os.environ.get("CONTAINER", ""),
-    "image": "" if runtime == "host" else os.environ.get("IMAGE", ""),
-    "port": int(os.environ["PORT"]),
-    "probe_level": os.environ.get("PROBE_LEVEL", ""),
-    "note": "由 probe_all.sh 生成（未经过 start_vllm.sh，模型/参数等字段请以实际进程为准）",
-}
-if runtime == "host":
-    host_python = os.environ.get("HOST_PYTHON_VALUE", "")
-    # host_python 供人读；"host" 字典与 report/suite 的 run_meta 契约保持一致
-    meta["host_python"] = host_python
-    meta["host"] = {"python": host_python}
-path = os.path.join(os.environ["RUN_META_DIR"], "run_meta.json")
-open(path, "w").write(json.dumps(meta, ensure_ascii=False, indent=2))
-PY
 fi
 
 log "==================== 全链路探测开始 ===================="
 log "运行目录：$RUN_DIR"
 log "目标：http://127.0.0.1:$PORT  档位：$PROBE_LEVEL"
 
-# 0) 前置检查
+# 0) 前置检查（实例带 --api-key 时要带 Authorization；/health 本身不校验）
+AUTH_ARGS=()
+if [[ -n "${VLLM_API_KEY:-}" ]]; then
+  AUTH_ARGS=(-H "Authorization: Bearer ${VLLM_API_KEY}")
+fi
 BASE="http://127.0.0.1:$PORT"
-code="$(curl -s -o /dev/null -w '%{http_code}' -m 5 "$BASE/health" || echo 000)"
+code="$(curl -s -o /dev/null -w '%{http_code}' -m 5 "${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"}" "$BASE/health" || echo 000)"
 [[ "$code" == "200" ]] || die "服务未就绪（$BASE/health = $code）；先 scripts/start_vllm.sh 或 scripts/wait_ready.sh"
 
 # 1) 开关自检
@@ -134,7 +136,7 @@ else
       --jsonl "$RUN_DIR/steps.jsonl" --summary "$RUN_DIR/steps_summary.json" \
       || warn "日志解析失败（可能没有 iteration 明细；档位需 >= steps）"
   else
-    warn "日志未落盘：docker 模式请确认 /logs 挂载；host 模式确认 start_vllm.sh 已写 serve.log（本次跳过 step 级解析）"
+    warn "日志未落盘（$RUN_DIR/serve.log）：docker 模式请确认 /logs 挂载；host 模式用 start_vllm.sh 启动；外部实例用 --log-file / PROBE_LOG_FILE 指定日志（本次跳过 step 级解析）"
   fi
 fi
 

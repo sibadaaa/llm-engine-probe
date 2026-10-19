@@ -42,6 +42,20 @@ def env_float(name: str, default: float) -> float:
         return default
 
 
+def mask_secret(value: str, *, keep: int = 4) -> str:
+    """把 API key 之类的敏感串打码：保留前 keep 位 + 末 keep 位。
+
+    产物（http_summary.json 等）会原样落盘配置，不能把明文 key 写进去；
+    打码后仍能人工核对"是不是同一把 key"。
+    """
+    text = str(value or "")
+    if text in ("", "EMPTY"):
+        return text
+    if len(text) <= keep * 2:
+        return "***"
+    return f"{text[:keep]}***{text[-keep:]}"
+
+
 @dataclass
 class ProbeConfig:
     """一次探测运行的全部上下文。"""
@@ -130,6 +144,8 @@ class ProbeConfig:
 
     def dump(self, path: str | Path | None = None) -> dict[str, Any]:
         data = asdict(self)
+        # 安全：产物里不能出现明文 API key（http_summary/suite 各场景会落这份配置）
+        data["api_key"] = mask_secret(self.api_key)
         data["url"] = self.request_url()
         if path is not None:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -137,6 +153,14 @@ class ProbeConfig:
                 json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
             )
         return data
+
+    # ------------------------------------------------------------------
+    def auth_headers(self) -> dict[str, str]:
+        """探测请求用的鉴权头（未配置 key 时返回空字典）。"""
+        key = str(self.api_key or "")
+        if key in ("", "EMPTY"):
+            return {}
+        return {"Authorization": f"Bearer {key}"}
 
     # ------------------------------------------------------------------
     def describe(self) -> str:

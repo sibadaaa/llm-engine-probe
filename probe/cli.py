@@ -78,11 +78,13 @@ def cmd_env(args: argparse.Namespace) -> int:
         checks.append({"name": name, "ok": ok, "detail": detail})
         print(f"[{'✅' if ok else '❌'}] {name}: {detail}")
 
-    # 1) 基本端点
+    # 1) 基本端点（实例开了 --api-key 时也要带鉴权；否则 /v1/models 会 401）
+    auth = cfg.auth_headers()
     for path, label in (("/health", "健康检查"), ("/v1/models", "模型列表")):
         url = cfg.base_url.rstrip("/") + path
         try:
-            with urllib.request.urlopen(url, timeout=10) as resp:
+            request = urllib.request.Request(url, headers=auth)
+            with urllib.request.urlopen(request, timeout=10) as resp:
                 body = resp.read(2000).decode("utf-8", errors="replace")
                 check(label, resp.status == 200, f"HTTP {resp.status} {body[:120].replace(chr(10), ' ')}")
         except urllib.error.HTTPError as exc:
@@ -210,7 +212,15 @@ def cmd_metrics(args: argparse.Namespace) -> int:
                 if rate:
                     print(f"  {name}: {rate:.3f}/s  (Δ={diff['counters'].get(name):.0f})")
             for name, row in (diff.get("histograms") or {}).items():
-                print(f"  {name}: n={row['count']:.0f} mean={row['mean_ms']:.1f}ms")
+                # 只有时间类直方图有 mean_ms；token/字节类按原单位显示（mean_ms=None，不能直接格式化）
+                unit = str(row.get("unit") or ("s" if str(name).endswith("_seconds") else ""))
+                if unit == "s":
+                    mean = row.get("mean_ms")
+                    mean_txt = "—" if mean is None else f"{mean:.1f}ms"
+                else:
+                    mean = row.get("mean")
+                    mean_txt = "—" if mean is None else f"{mean:.1f} {unit}".rstrip()
+                print(f"  {name}: n={row['count']:.0f} mean={mean_txt}")
         return 0
 
     path, snap = save_snapshot(cfg, tag=args.tag)

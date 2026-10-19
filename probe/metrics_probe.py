@@ -305,7 +305,10 @@ def fetch_metrics(cfg: ProbeConfig, timeout: float | None = None) -> MetricsSnap
     """抓取并解析 ``/metrics``（在线模式下使用）。"""
     import urllib.request
 
-    request = urllib.request.Request(cfg.metrics_url, headers={"Accept": "text/plain"})
+    headers = {"Accept": "text/plain"}
+    # 反代/网关可能要求鉴权；实例开了 --api-key 时带上
+    headers.update(cfg.auth_headers())
+    request = urllib.request.Request(cfg.metrics_url, headers=headers)
     with urllib.request.urlopen(request, timeout=timeout or min(cfg.timeout, 30)) as resp:
         text = resp.read().decode("utf-8", errors="replace")
         snap = parse_metrics_text(
@@ -462,6 +465,22 @@ DROP_INTERVAL_METRICS = {
 }
 
 
+def histogram_unit(name: str) -> str:
+    """直方图的单位：只有 ``*_seconds`` 是时间（秒→毫秒），其余按原值。
+
+    vLLM 把 token 数、字节数也导出成 histogram（例如 ``vllm:request_prompt_tokens``），
+    早期实现对所有 histogram 都乘 1000，导致报告出现 "均值 709000.0 ms" 这种错误。
+    """
+    base = str(name or "")
+    if base.endswith("_seconds"):
+        return "s"
+    if "tokens" in base:
+        return "tokens"
+    if "bytes" in base:
+        return "bytes"
+    return "count"
+
+
 def diff_snapshots(
     before: MetricsSnapshot,
     after: MetricsSnapshot,
@@ -487,9 +506,13 @@ def diff_snapshots(
             sb = sum(s.value for s in fb.series if s.name.endswith("_sum"))
             sa = sum(s.value for s in fa.series if s.name.endswith("_sum"))
             if ca - cb > 0:
+                mean = (sa - sb) / (ca - cb)
+                unit = histogram_unit(name)
                 result["histograms"][name] = {
                     "count": ca - cb,
-                    "mean_ms": (sa - sb) / (ca - cb) * 1000.0,
+                    "unit": unit,
+                    "mean": mean,
+                    "mean_ms": mean * 1000.0 if unit == "s" else None,
                 }
     model_name = model or (after.meta.get("model") if after.meta else None)
     result["model"] = model_name

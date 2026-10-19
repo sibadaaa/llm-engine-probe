@@ -46,6 +46,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import shlex
 import shutil
 import socket
@@ -217,15 +218,99 @@ def _extract_py_info(stdout: str) -> dict[str, Any] | None:
     return None
 
 
+# HOST_PRELUDE_FILES 的 token 可能是 `K=V`（先 export，给后面的环境脚本准备变量）
+# 或文件路径（存在则 source）。规则与 scripts/lib/common.sh 的 host_prelude_shell 一致。
+_PRELUDE_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _prelude_tokens(raw: str) -> list[str]:
+    raw = str(raw or "").strip()
+    if not raw:
+        return []
+    try:
+        tokens = shlex.split(raw)
+    except ValueError:
+        tokens = raw.split()
+    return [item for item in tokens if item]
+
+
+def _prelude_shell(raw: str) -> str:
+    """把 ``HOST_PRELUDE_FILES`` 转成 shell 片段（K=V → export；文件 → source）。"""
+    out: list[str] = []
+    for token in _prelude_tokens(raw):
+        if _PRELUDE_ASSIGN_RE.match(token):
+            name, _, value = token.partition("=")
+            out.append(f"export {name}={shlex.quote(value)}; ")
+        else:
+            path = os.path.expanduser(token)
+            quoted = shlex.quote(path)
+            out.append(f"if [ -f {quoted} ]; then . {quoted} >/dev/null 2>&1 || true; fi; ")
+    return "".join(out)
+
+
+def _host_pythonpath_default() -> str:
+    """与 common.sh 的 host_pythonpath 对齐：SRC_DIR + 项目根 + TRITON_INSTALL_DIR。"""
+    parts: list[str] = []
+    src = os.environ.get("SRC_DIR", "").strip()
+    if src:
+        parts.append(src)
+    parts.append(str(Path(__file__).resolve().parent.parent))
+    triton = os.environ.get("TRITON_INSTALL_DIR", "").strip()
+    if triton:
+        parts.append(triton)
+    return ":".join(parts)
+
+
+def _probe_command(
+    exe: str,
+    script: str,
+    *,
+    prelude: str = "",
+    pythonpath: str | None = None,
+) -> list[str]:
+    """构造 import 探针命令。
+
+    有 prelude 或 PYTHONPATH 时经 bash 注入宿主环境（与 serve_launch.sh 一致），
+    否则保持 `[exe, "-c", script]` 直跑（无额外依赖）。
+    """
+    shell_body = _prelude_shell(prelude)
+    if pythonpath is None:
+        pythonpath = os.environ.get("HOST_PROBE_PYTHONPATH") or _host_pythonpath_default()
+    pythonpath = str(pythonpath or "")
+    if not shell_body and not pythonpath:
+        return [exe, "-c", script]
+    bash = shutil.which("bash")
+    if not bash:
+        return [exe, "-c", script]
+    parts = [shell_body]
+    if pythonpath:
+        parts.append(
+            f"export PYTHONPATH={shlex.quote(pythonpath)}" + '"${PYTHONPATH:+:$PYTHONPATH}"; '
+        )
+    parts.append(f"exec {shlex.quote(exe)} -c {shlex.quote(script)}")
+    return [bash, "-c", "".join(parts)]
+
+
 def _probe_host_python(
-    exe: str, *, check_torch: bool, check_vllm: bool, timeout: float = 180.0
+    exe: str,
+    *,
+    check_torch: bool,
+    check_vllm: bool,
+    prelude: str = "",
+    pythonpath: str | None = None,
+    timeout: float = 180.0,
 ) -> tuple[dict[str, Any] | None, str | None]:
-    """在宿主解释器里跑一次汇总探针，返回 (info, error)。"""
+    """在宿主解释器里跑一次汇总探针，返回 (info, error)。
+
+    import vllm/torch 与真实启动（serve_launch.sh）在同一环境里进行：
+    先 source ``HOST_PRELUDE_FILES``（支持 K=V），再注入 host PYTHONPATH。
+    """
     script = _PY_PROBE_TEMPLATE.replace("__CHECK_TORCH__", repr(bool(check_torch)))
     script = script.replace("__CHECK_VLLM__", repr(bool(check_vllm)))
+    command = _probe_command(exe, script, prelude=prelude, pythonpath=pythonpath)
     try:
         proc = subprocess.run(
-            [exe, "-c", script],
+            command,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -741,22 +826,37 @@ def _check_prelude(ctx: _Context, tr: _Tracker) -> None:
     if not raw:
         tr.add("prelude", True, "未配置 HOST_PRELUDE_FILES（无厂商 prelude）")
         return
-    try:
-        files = shlex.split(raw)
-    except ValueError:
-        files = raw.split()
-    files = [item for item in files if item]
+    tokens = _prelude_tokens(raw)
+    files: list[str] = []
+    assignments: list[str] = []
+    for token in tokens:
+        if _PRELUDE_ASSIGN_RE.match(token):
+            assignments.append(token)
+        else:
+            files.append(token)
     missing = [item for item in files if not Path(os.path.expanduser(item)).is_file()]
     if missing:
         tr.add(
             "prelude",
             False,
             f"缺失 {len(missing)} 个 prelude 文件：{', '.join(missing)}",
-            hint="确认厂商环境脚本路径（HOST_PRELUDE_FILES），或清空该变量表示不需要 source",
+            hint=(
+                "确认厂商环境脚本路径（HOST_PRELUDE_FILES），或清空该变量表示不需要 source；"
+                "需要先设置变量时可用 K=V 写法，如 DTK_ROOT=/opt/dtk2604 /opt/dtk/env.sh"
+            ),
             severity="warn",
         )
-    else:
-        tr.add("prelude", True, f"{len(files)} 个 prelude 文件均存在：{', '.join(files)}")
+        return
+    details: list[str] = []
+    if files:
+        details.append(f"{len(files)} 个 prelude 文件：{', '.join(files)}")
+    if assignments:
+        details.append(f"{len(assignments)} 个环境变量：{', '.join(assignments)}")
+    tr.add(
+        "prelude",
+        True,
+        "；".join(details) + "（import 探针已按该环境执行）",
+    )
 
 
 _CHECKS: tuple[tuple[str, Callable[[_Context, _Tracker], None]], ...] = (
@@ -823,6 +923,8 @@ def collect_hostcheck(
     if prelude is None:
         prelude = os.environ.get("HOST_PRELUDE_FILES", "")
     prelude = str(prelude or "")
+    # import 探针与真实启动使用同一套 PYTHONPATH（shell 侧显式传入优先）
+    probe_pythonpath = os.environ.get("HOST_PROBE_PYTHONPATH") or _host_pythonpath_default()
 
     quick = bool(quick or start)
     check_torch = not quick
@@ -839,7 +941,11 @@ def collect_hostcheck(
     if host_python_ok:
         try:
             py_info, py_error = _probe_host_python(
-                py_for_probe, check_torch=check_torch, check_vllm=check_vllm
+                py_for_probe,
+                check_torch=check_torch,
+                check_vllm=check_vllm,
+                prelude=prelude,
+                pythonpath=probe_pythonpath,
             )
         except Exception as exc:  # 探测子进程本身的异常也只降级为 warn
             py_info, py_error = None, f"{type(exc).__name__}: {exc}"

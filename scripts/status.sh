@@ -26,6 +26,12 @@ done
 
 BASE="http://127.0.0.1:$PORT"
 
+# 实例带 --api-key 启动时，端点探测要带 Authorization（未设置则不加）
+AUTH_ARGS=()
+if [[ -n "${VLLM_API_KEY:-}" ]]; then
+  AUTH_ARGS=(-H "Authorization: Bearer ${VLLM_API_KEY}")
+fi
+
 echo "===================== 运行方式 ====================="
 echo "运行时：$RUNTIME"
 echo "厂商：$VENDOR（$VENDOR_LABEL）  SMI：${VENDOR_SMI_CMD:-无}"
@@ -34,14 +40,21 @@ echo "厂商：$VENDOR（$VENDOR_LABEL）  SMI：${VENDOR_SMI_CMD:-无}"
 DESCRIBE_RC=0
 instance_describe || DESCRIBE_RC=$?
 echo  # instance_describe 用 printf 输出、不带换行
-if (( DESCRIBE_RC != 0 )) && runtime_is_host; then
-  # docker 模式下 instance_describe 已经说明了容器状态，这里只给 host 模式补充启动指引
-  echo "（宿主机没有正在运行的 vLLM 实例；先执行 scripts/start_vllm.sh --host）"
-fi
 if runtime_is_host; then
+  HOST_VLLM_PIDS="$(host_vllm_pids 2>/dev/null || true)"
+  if (( DESCRIBE_RC != 0 )); then
+    # start_vllm.sh --host 会写 serve.pid；没有时可能是外部方式启动的实例，
+    # 这里按 HOST_VLLM_PATTERN 只读匹配，提示"外部实例"而不是误报"未运行"。
+    if [[ -n "$HOST_VLLM_PIDS" ]]; then
+      echo "（外部实例：非本工具启动、未记录 serve.pid；按进程名匹配到 $(printf '%s\n' "$HOST_VLLM_PIDS" | wc -l | tr -d ' ') 个 vLLM 进程）"
+    else
+      echo "（宿主机没有正在运行的 vLLM 实例；先执行 scripts/start_vllm.sh --host）"
+    fi
+  fi
   HOST_PY="$(host_python 2>/dev/null || echo python3)"
   echo "  HOST_PYTHON：$HOST_PY"
-  echo "  vLLM 版本：$("$HOST_PY" -c 'import vllm; print(vllm.__version__)' 2>/dev/null || echo '未知（当前 HOST_PYTHON 环境里 import vllm 失败）')"
+  # 版本探测与真实启动同环境（source prelude + host PYTHONPATH），避免假失败
+  echo "  vLLM 版本：$(host_exec "$HOST_PY" -c 'import vllm; print(vllm.__version__)' 2>/dev/null || echo '未知（HOST_PYTHON 环境里 import vllm 失败；检查 HOST_PRELUDE_FILES / SRC_DIR）')"
   # 进程表（pid/etime/args）：优先看 start_vllm.sh --host 记录的本实例（serve.pid），
   # 没有本工具启动的实例时，只读地列出宿主机上按 pattern 能匹配到的 vLLM 进程（诊断用）。
   if host_instance_running 2>/dev/null; then
@@ -49,16 +62,13 @@ if runtime_is_host; then
     echo "  --- 本实例进程（serve.pid） ---"
     printf '  %-9s %-10s %s\n' "PID" "ELAPSED" "ARGS"
     ps -o pid=,etime=,args= -p "$INSTANCE_PID" 2>/dev/null | cut -c1-200 | sed 's/^[[:space:]]*/  /' || true
-  else
-    HOST_VLLM_PIDS="$(host_vllm_pids 2>/dev/null || true)"
-    if [[ -n "$HOST_VLLM_PIDS" ]]; then
-      echo "  --- 宿主机上匹配 vLLM 的进程（pgrep -f \"${HOST_VLLM_PATTERN:-…}\"） ---"
-      printf '  %-9s %-10s %s\n' "PID" "ELAPSED" "ARGS"
-      while IFS= read -r _pid; do
-        [[ -n "$_pid" ]] || continue
-        ps -o pid=,etime=,args= -p "$_pid" 2>/dev/null | cut -c1-200 | sed 's/^[[:space:]]*/  /' || true
-      done <<< "$HOST_VLLM_PIDS"
-    fi
+  elif [[ -n "$HOST_VLLM_PIDS" ]]; then
+    echo "  --- 宿主机上匹配 vLLM 的进程（pgrep -f \"${HOST_VLLM_PATTERN:-…}\"） ---"
+    printf '  %-9s %-10s %s\n' "PID" "ELAPSED" "ARGS"
+    while IFS= read -r _pid; do
+      [[ -n "$_pid" ]] || continue
+      ps -o pid=,etime=,args= -p "$_pid" 2>/dev/null | cut -c1-200 | sed 's/^[[:space:]]*/  /' || true
+    done <<< "$HOST_VLLM_PIDS"
   fi
 fi
 
@@ -66,15 +76,17 @@ echo
 echo "===================== 端点 ====================="
 # 注意：curl -w '%{http_code}' 在连接失败时自己就会输出 000，
 # 这里不能再 `|| echo 000`（会变成 000000），只用 `|| true` 防止 set -e 退出。
-printf '%-28s %s\n' "/health" "$(curl -s -o /dev/null -w '%{http_code}' -m 5 "$BASE/health" 2>/dev/null || true)"
-printf '%-28s %s\n' "/v1/models" "$(curl -s -o /dev/null -w '%{http_code}' -m 5 "$BASE/v1/models" 2>/dev/null || true)"
-printf '%-28s %s\n' "/metrics" "$(curl -s -o /dev/null -w '%{http_code}' -m 10 "$BASE/metrics" 2>/dev/null || true)"
-printf '%-28s %s\n' "/start_profile(profiler)" \
-  "$(curl -s -o /dev/null -w '%{http_code}' -m 5 -X POST "$BASE/start_profile" 2>/dev/null || true)"
+printf '%-28s %s\n' "/health" "$(curl -s -o /dev/null -w '%{http_code}' -m 5 "${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"}" "$BASE/health" 2>/dev/null || true)"
+printf '%-28s %s\n' "/v1/models" "$(curl -s -o /dev/null -w '%{http_code}' -m 5 "${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"}" "$BASE/v1/models" 2>/dev/null || true)"
+printf '%-28s %s\n' "/metrics" "$(curl -s -o /dev/null -w '%{http_code}' -m 10 "${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"}" "$BASE/metrics" 2>/dev/null || true)"
+# 只读探活：用 GET 而不是 POST /start_profile（对生产实例绝无副作用）。
+# 404=未配置 profiler；405/200/400=路由存在；其它按原样显示。
+printf '%-28s %s\n' "/start_profile(profiler，只读探活)" \
+  "$(curl -s -o /dev/null -w '%{http_code}' -m 5 "${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"}" "$BASE/start_profile" 2>/dev/null || true)"
 
 echo
 echo "===================== 关键指标 ====================="
-if curl -s -m 10 "$BASE/metrics" > /tmp/.vllm_probe_metrics 2>/dev/null; then
+if curl -s -m 10 "${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"}" "$BASE/metrics" > /tmp/.vllm_probe_metrics 2>/dev/null; then
   py - <<'PY'
 import sys
 from probe.metrics_probe import parse_metrics_text, engine_state
@@ -112,11 +124,32 @@ LATEST=""
 if ! LATEST="$(latest_run_dir 2>/dev/null)"; then
   LATEST=""
 fi
+LOG_FILE=""
 if [[ -n "$LATEST" && -f "$LATEST/serve.log" ]]; then
-  echo "  运行目录：$LATEST"
-  echo "  日志行数：$(wc -l < "$LATEST/serve.log")"
+  LOG_FILE="$LATEST/serve.log"
+fi
+# 外部启动实例：日志通常不在 RUN_DIR/serve.log，依次看 run_meta["serve_log"] 与 PROBE_LOG_FILE
+if [[ -z "$LOG_FILE" && -n "$LATEST" && -f "$LATEST/run_meta.json" ]]; then
+  LOG_FILE="$(py - "$LATEST/run_meta.json" 2>/dev/null <<'PY'
+import json, os, sys
+try:
+    meta = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    raise SystemExit(0)
+path = str(meta.get("serve_log") or "").strip()
+if path and os.path.isfile(path):
+    print(path)
+PY
+)"
+fi
+if [[ -z "$LOG_FILE" && -n "${PROBE_LOG_FILE:-}" && -f "${PROBE_LOG_FILE}" ]]; then
+  LOG_FILE="$PROBE_LOG_FILE"
+fi
+if [[ -n "$LOG_FILE" && -f "$LOG_FILE" ]]; then
+  echo "  日志文件：$LOG_FILE"
+  echo "  日志行数：$(wc -l < "$LOG_FILE")"
   echo "  --- 最近 5 条 step/统计 ---"
-  py -m probe logs --file "$LATEST/serve.log" --live --live-tail 5 2>/dev/null | sed 's/^/  /' || true
+  py -m probe logs --file "$LOG_FILE" --live --live-tail 5 2>/dev/null | sed 's/^/  /' || true
 else
-  echo "  （未找到运行目录日志）"
+  echo "  （未找到运行目录日志；外部实例可设置 PROBE_LOG_FILE 或在 run_meta.json 里写 serve_log）"
 fi

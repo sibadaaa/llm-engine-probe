@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import os
 import statistics
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -126,7 +127,16 @@ class Artifacts:
         art.key_averages = load_json(d / "key_averages.json")
         art.gpu_telem_rows = load_jsonl(d / "gpu_telem.jsonl")
         log = d / SERVE_LOG
-        art.serve_log = log if log.exists() else None
+        if log.exists():
+            art.serve_log = log
+        else:
+            # 外部启动的实例日志不在 RUN_DIR 下：回退读 run_meta["serve_log"]
+            # （probe_all --log-file 也会把日志复制成 RUN_DIR/serve.log）
+            meta_log = str(art.meta.get("serve_log") or "").strip()
+            if meta_log:
+                candidate = Path(os.path.expanduser(meta_log))
+                if candidate.is_file():
+                    art.serve_log = candidate
         for extra in ("env_check.json", "profiler_files.json", "suite_results.json", "vendor_info.json"):
             data = load_json(d / extra)
             if data is not None:
@@ -251,6 +261,7 @@ def _section_overview(art: Artifacts) -> str:
             ("torch key-averages", art.key_averages is not None),
             (f"{_smi_hint(art)} 采样", bool(art.gpu_telem_rows)),
             ("引擎日志", art.serve_log is not None),
+            ("标准化套件", art.extras.get("suite_results.json") is not None),
         )
         if ok
     ]
@@ -648,11 +659,18 @@ def _section_schedule(art: Artifacts) -> str:
                 + table(["计数器", "速率", "增量"], rows)
             )
     if diff and diff.get("histograms"):
-        rows = [
-            [name, fmt(value.get("count"), 0), fmt(value.get("mean_ms"))]
-            for name, value in diff["histograms"].items()
-        ]
-        lines.append("\n**探测窗口内的直方图增量（均值）**\n\n" + table(["指标", "样本", "均值 ms"], rows))
+        rows = []
+        for name, value in diff["histograms"].items():
+            unit = str(value.get("unit") or ("s" if str(name).endswith("_seconds") else ""))
+            if unit == "s":
+                mean_txt = f"{fmt(value.get('mean_ms'))} ms"
+            else:
+                mean_txt = f"{fmt(value.get('mean'))} {unit}".strip()
+            rows.append([name, fmt(value.get("count"), 0), mean_txt])
+        lines.append(
+            "\n**探测窗口内的直方图增量（均值）**\n\n"
+            + table(["指标", "样本", "均值"], rows)
+        )
     return "\n".join(lines)
 
 

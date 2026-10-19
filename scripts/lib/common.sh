@@ -86,6 +86,11 @@ fi
 : "${REPEAT:=3}"
 : "${SHARED_PREFIX_TOKENS:=0}"
 : "${PROBE_ENDPOINT:=chat}"
+# 实例带 --api-key 启动时，探测请求需要这个 key（probe/status 都会带上；产物里会打码）
+: "${VLLM_API_KEY:=}"
+# 外部启动实例的日志路径（不是本工具启动、日志不在 RUN_DIR/serve.log 时用；
+# probe_all.sh 会复制成 <RUN_DIR>/serve.log 再做 step 解析）
+: "${PROBE_LOG_FILE:=}"
 : "${GPU_SAMPLE_INTERVAL:=1}"
 : "${PROFILER_WITH_STACK:=true}"
 : "${PROFILER_WITH_FLOPS:=true}"
@@ -128,6 +133,7 @@ export GPU_MEM_UTIL MAX_MODEL_LEN MAX_NUM_BATCHED_TOKENS MAX_NUM_SEQS EAGER VISI
 export DRAFT_MODEL SPEC_METHOD SPEC_TOKENS PROBE_LEVEL RUNS_DIR WARMUP_TIMEOUT
 export RUNTIME HOST_PYTHON HOST_SERVE_ENTRYPOINT HOST_PRECHECK HOST_PRELUDE_FILES
 export HOST_STOP_TIMEOUT HOST_VLLM_PATTERN PYSPY_BIN PROBE_SKIP_VRAM_WAIT
+export VLLM_API_KEY PROBE_LOG_FILE
 
 # ---------------------------------------------------------------------------
 # 厂商适配层（vendors/<id>.sh ↔ probe/vendors.py）
@@ -361,7 +367,9 @@ new_run_dir() {
 latest_run_dir() {
   if [[ -n "$RUN_DIR" ]]; then echo "$RUN_DIR"; return 0; fi
   local latest
-  latest="$(ls -1d "$RUNS_DIR"/*/ 2>/dev/null | sort | tail -1 || true)"
+  # 按目录 mtime 取最新：`sort` 是目录名字符串排序，跨前缀/手工目录时会选错
+  # （例如 runs/optmatrix-20261016 会压过真正刚写入的 runs/host-live-<ts>）。
+  latest="$(ls -1dt "$RUNS_DIR"/*/ 2>/dev/null | head -1 || true)"
   [[ -n "$latest" ]] || return 1
   echo "${latest%/}"
 }
@@ -401,22 +409,163 @@ host_pythonpath() {
   printf '%s' "${parts[*]}"
 }
 
-# host 模式启动前 source 的宿主机环境脚本（空格分隔；不存在的文件静默跳过）
+# host 模式启动前 source 的宿主机环境（空格分隔，顺序即执行顺序）
+#
+# 每个 token 支持两种写法：
+#   * `K=V`            → export K=V（用于给后面的环境脚本准备变量，如 DTK_ROOT）
+#   * 任意文件路径      → 存在则 source（不存在静默跳过）
+#
+# 例：HOST_PRELUDE_FILES="DTK_ROOT=/opt/dtk2604 /opt/dtk/env.sh"
+# （Hygon 的 env.sh 依赖先 export DTK_ROOT；此前只支持文件，导致这类脚本无法生效。）
 host_prelude_shell() {
-  local out="" f q
+  local out="" f name value q
   for f in ${HOST_PRELUDE_FILES:-}; do
     [[ -n "$f" ]] || continue
+    if [[ "$f" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      name="${BASH_REMATCH[1]}"
+      value="${BASH_REMATCH[2]}"
+      out+="export ${name}=$(printf '%q' "$value"); "
+      continue
+    fi
     q="$(printf '%q' "$f")"
     out+="if [ -f $q ]; then . $q >/dev/null 2>&1 || true; fi; "
   done
   printf '%s' "$out"
 }
 
+# 在「source 过 host prelude + 注入 host PYTHONPATH」的宿主环境里执行命令。
+# 与 start_vllm.sh 生成的 serve_launch.sh 保持同一套环境，避免
+# host_check / status / run_meta 版本探测在需要 prelude 的机器上假失败。
+#
+# 用法：host_exec <cmd> [args...]
+host_exec() {
+  [[ $# -gt 0 ]] || die "host_exec 需要命令参数"
+  local prelude pypp cmd
+  prelude="$(host_prelude_shell)"
+  pypp="$(host_pythonpath)"
+  cmd="$(printf '%q ' "$@")"
+  if ! command -v bash >/dev/null 2>&1; then
+    # 没有 bash 时退化为直接执行（prelude 多数是 bash 脚本，此分支仅兜底）
+    "$@"
+    return $?
+  fi
+  HOST_PROBE_PYTHONPATH="$pypp" bash -c '
+'"${prelude}"'
+if [ -n "${HOST_PROBE_PYTHONPATH:-}" ]; then
+  export PYTHONPATH="${HOST_PROBE_PYTHONPATH}${PYTHONPATH:+:$PYTHONPATH}"
+fi
+exec '"${cmd}"
+}
+
+# 宿主环境元信息 JSON（python/python_version/vllm_version/torch_version/hostname/kernel）
+# 在 prelude + host PYTHONPATH 下采集；采集失败时只回填 python/hostname/kernel。
+host_meta_json() {
+  local py out
+  py="$(host_python)"
+  out="$(HOST_PY_NAME="$py" host_exec "$py" - <<'PY' 2>/dev/null || true
+import json, os, platform, socket
+
+def _ver(mod):
+    try:
+        m = __import__(mod)
+        return str(getattr(m, "__version__", "")) or None
+    except Exception:
+        return None
+
+print(json.dumps({
+    "python": os.environ.get("HOST_PY_NAME") or None,
+    "python_version": platform.python_version(),
+    "vllm_version": _ver("vllm"),
+    "torch_version": _ver("torch"),
+    "hostname": socket.gethostname(),
+    "kernel": platform.release(),
+}, ensure_ascii=False))
+PY
+)"
+  if [[ -z "$out" ]]; then
+    out="$(py - "$py" <<'PY' 2>/dev/null || true
+import json, platform, socket, sys
+print(json.dumps({
+    "python": sys.argv[1] if len(sys.argv) > 1 else None,
+    "python_version": None,
+    "vllm_version": None,
+    "torch_version": None,
+    "hostname": socket.gethostname(),
+    "kernel": platform.release(),
+}, ensure_ascii=False))
+PY
+)"
+  fi
+  [[ -n "$out" ]] || out='{"python": null, "python_version": null, "vllm_version": null, "torch_version": null, "hostname": null, "kernel": null}'
+  printf '%s' "$out"
+}
+
+# 为「不是 start_vllm.sh 启动的实例」（外部 systemd/docker exec/手动启动）补一份最小
+# run_meta.json：至少让 report/suite 知道 runtime（docker|host）、host 环境和厂商，
+# 避免把裸机实例误标成容器。已存在 run_meta.json 时不动。
+#
+# 用法：write_minimal_run_meta <run_dir>
+write_minimal_run_meta() {
+  local run_dir="${1:-${RUN_DIR:-}}" host_json="{}" runtime
+  [[ -n "$run_dir" ]] || return 1
+  mkdir -p "$run_dir"
+  [[ -f "$run_dir/run_meta.json" ]] && return 0
+  runtime="$(runtime_normalize "${RUNTIME:-docker}")"
+  if [[ "$runtime" == "host" ]]; then
+    host_json="$(host_meta_json)"
+  fi
+  RUN_META_DIR="$run_dir" RUNTIME_VALUE="$runtime" PORT_VALUE="$PORT" PROBE_LEVEL_VALUE="$PROBE_LEVEL" \
+  VENDOR_VALUE="$VENDOR" VENDOR_LABEL_VALUE="$VENDOR_LABEL" MODEL_VALUE="$MODEL" \
+  SERVED_NAME_VALUE="$SERVED_NAME" IMAGE_VALUE="$IMAGE" CONTAINER_VALUE="$CONTAINER" \
+  TP_VALUE="$TP" MAXLEN_VALUE="$MAX_MODEL_LEN" MBT_VALUE="$MAX_NUM_BATCHED_TOKENS" \
+  EAGER_VALUE="$EAGER" HOST_META_JSON="$host_json" PROBE_LOG_FILE_VALUE="${PROBE_LOG_FILE:-}" \
+  py - <<'PY'
+import json, os, time
+
+runtime = os.environ["RUNTIME_VALUE"]
+meta = {
+    "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    "runtime": runtime,
+    "vendor": os.environ.get("VENDOR_VALUE", ""),
+    "vendor_label": os.environ.get("VENDOR_LABEL_VALUE", ""),
+    "image": os.environ.get("IMAGE_VALUE", "") if runtime == "docker" else "",
+    "container": os.environ.get("CONTAINER_VALUE", "") if runtime == "docker" else "",
+    "model": os.environ.get("MODEL_VALUE", ""),
+    "served_name": os.environ.get("SERVED_NAME_VALUE", ""),
+    "port": int(os.environ.get("PORT_VALUE") or 0),
+    "probe_level": os.environ.get("PROBE_LEVEL_VALUE", ""),
+    "tensor_parallel_size": int(os.environ.get("TP_VALUE") or 0),
+    "max_model_len": int(os.environ.get("MAXLEN_VALUE") or 0),
+    "max_num_batched_tokens": int(os.environ.get("MBT_VALUE") or 0),
+    "enforce_eager": os.environ.get("EAGER_VALUE") == "1",
+    "note": "由脚本自动生成（实例未经过 start_vllm.sh，模型/参数等字段请以实际进程为准）",
+}
+if runtime == "host":
+    try:
+        host = json.loads(os.environ.get("HOST_META_JSON") or "{}")
+    except Exception:
+        host = {}
+    if not isinstance(host, dict):
+        host = {}
+    for key in ("python", "python_version", "vllm_version", "torch_version", "hostname", "kernel"):
+        host.setdefault(key, None)
+    meta["host"] = host
+    meta["host_python"] = host.get("python")
+log_file = (os.environ.get("PROBE_LOG_FILE_VALUE") or "").strip()
+if log_file:
+    meta["serve_log"] = log_file
+open(os.path.join(os.environ["RUN_META_DIR"], "run_meta.json"), "w").write(
+    json.dumps(meta, ensure_ascii=False, indent=2) + "\n"
+)
+PY
+}
+
 # 解析要操作的 run dir：显式参数 → $RUN_DIR → 最新 runs/* 目录；找不到返回空（不 die）
 _host_resolve_run_dir() {
   local run_dir="${1:-${RUN_DIR:-}}"
   if [[ -z "$run_dir" ]]; then
-    run_dir="$(ls -1d "$RUNS_DIR"/*/ 2>/dev/null | sort | tail -1 || true)"
+    # 与 latest_run_dir 一致：按 mtime 取最新，避免按目录名排序选错
+    run_dir="$(ls -1dt "$RUNS_DIR"/*/ 2>/dev/null | head -1 || true)"
     run_dir="${run_dir%/}"
   fi
   printf '%s' "$run_dir"
@@ -634,7 +783,8 @@ instance_describe() {
       printf 'host（PID=%s PGID=%s）' "$pid" "${pgid:-$pid}"
       return 0
     fi
-    printf 'host（未运行）'
+    # 没有 serve.pid 不代表没实例（可能是外部 systemd/手动启动），只说"未记录"
+    printf 'host（未记录 serve.pid）'
     return 1
   fi
   if container_running "$CONTAINER"; then

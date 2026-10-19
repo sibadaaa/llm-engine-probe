@@ -240,6 +240,36 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 6) 公共辅助：latest_run_dir 按 mtime / prelude 支持 K=V / host_exec 注入环境
+# ---------------------------------------------------------------------------
+echo
+echo "---- 6) 公共辅助函数 ----"
+RUNS_TMP="$TMP/runs"
+mkdir -p "$RUNS_TMP/zzz-old" "$RUNS_TMP/aaa-new"
+touch -d '2026-01-01 00:00:00' "$RUNS_TMP/zzz-old"
+touch -d '2026-01-02 00:00:00' "$RUNS_TMP/aaa-new"
+LATEST_PICKED="$(RUNS_DIR="$RUNS_TMP" RUN_DIR="" bash -c 'source scripts/lib/common.sh; latest_run_dir' 2>/dev/null || true)"
+if [[ "$LATEST_PICKED" == "$RUNS_TMP/aaa-new" ]]; then
+  chk_pass "latest_run_dir 按 mtime 选最新（不是目录名字符串排序）"
+else
+  chk_fail "latest_run_dir 选择错误：${LATEST_PICKED:-<空>}（期望 $RUNS_TMP/aaa-new）"
+fi
+
+PRELUDE_SHELL="$(HOST_PRELUDE_FILES="PROBE_PRELUDE_MARK=ok" bash -c 'source scripts/lib/common.sh; host_prelude_shell' 2>/dev/null || true)"
+if [[ "$PRELUDE_SHELL" == *"export PROBE_PRELUDE_MARK=ok"* ]]; then
+  chk_pass "host_prelude_shell 支持 K=V 写法"
+else
+  chk_fail "host_prelude_shell 未处理 K=V：$PRELUDE_SHELL"
+fi
+
+EXEC_MARK="$(HOST_PRELUDE_FILES="PROBE_EXEC_MARK=ok" bash -c 'source scripts/lib/common.sh; host_exec bash -c "printf %s \"\${PROBE_EXEC_MARK:-missing}\""' 2>/dev/null || true)"
+if [[ "$EXEC_MARK" == "ok" ]]; then
+  chk_pass "host_exec 在 source 过 prelude 的环境里执行命令"
+else
+  chk_fail "host_exec 未注入 prelude 环境（得到：${EXEC_MARK:-<空>}）"
+fi
+
+# ---------------------------------------------------------------------------
 # 汇总
 # ---------------------------------------------------------------------------
 echo
