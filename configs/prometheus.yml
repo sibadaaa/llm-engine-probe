@@ -1,5 +1,5 @@
 # ============================================================================
-# Prometheus 配置 — vllm-docker-probe 可选观测栈
+# Prometheus 配置 — llm-engine-probe 可选观测栈
 #
 # 目标：抓取 vLLM 服务（任意厂商：NVIDIA/AMD/Hygon/Intel/Ascend）暴露的 /metrics。
 #

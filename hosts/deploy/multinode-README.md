@@ -96,7 +96,7 @@ worker 加载不到模型时会在 `serve.log` 里报错。
 ## 4. 先 dry-run（默认行为）
 
 ```bash
-cd /path/to/vllm-docker-probe
+cd /path/to/llm-engine-probe
 
 # ① 看两个模板叠加结果（不启动）
 hosts/vllm-host.sh show deploy/multinode-head
@@ -123,7 +123,7 @@ NODES=2 NODE_RANK=0 HEAD_ADDR=10.0.0.10 hosts/deploy/multinode-run.sh
 ### head（rank 0）
 
 ```bash
-cd /path/to/vllm-docker-probe
+cd /path/to/llm-engine-probe
 MULTINODE_ENABLE=1 \
 NODES=2 NODE_RANK=0 \
 HEAD_ADDR=10.0.0.10 HEAD_PORT=29500 \
@@ -143,7 +143,7 @@ EXTRA_VLLM_ARGS='--nnodes 2 --node-rank 0 --master-addr 10.0.0.10 --master-port 
 ### worker（rank 1..N-1，每台分别执行）
 
 ```bash
-cd /path/to/vllm-docker-probe
+cd /path/to/llm-engine-probe
 MULTINODE_ENABLE=1 \
 NODES=2 NODE_RANK=1 \
 HEAD_ADDR=10.0.0.10 HEAD_PORT=29500 \

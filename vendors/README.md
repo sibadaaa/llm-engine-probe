@@ -1,6 +1,6 @@
 # vendors/ · 厂商适配层
 
-本目录是 vllm-docker-probe 的**厂商抽象层**（Shell 端）。每个文件描述一家
+本目录是 llm-engine-probe 的**厂商抽象层**（Shell 端）。每个文件描述一家
 显卡生态在「容器启动 / 设备直通 / 环境注入 / 遥测命令」上的差异，Python 端
 的分析适配（trace 规则包、报告文案、遥测解析）在 `probe/vendors.py` 注册。
 

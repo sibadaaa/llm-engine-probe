@@ -16,9 +16,9 @@
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
-LABEL org.opencontainers.image.title="vllm-docker-probe" \
+LABEL org.opencontainers.image.title="llm-engine-probe" \
       org.opencontainers.image.description="vLLM 推理全流程探测工具镜像（多厂商：NVIDIA/AMD/Hygon/Intel/Ascend）" \
-      org.opencontainers.image.source="vllm-docker-probe" \
+      org.opencontainers.image.source="llm-engine-probe" \
       vllm.probe.base_image="${BASE_IMAGE}"
 
 ARG PIP_PACKAGES=""

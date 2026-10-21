@@ -1,5 +1,5 @@
 # ============================================================================
-# vllm-docker-probe 快捷入口
+# llm-engine-probe 快捷入口
 #   默认目标：help
 #   所有脚本都可以单独调用；这里只是把常用参数固化下来。
 #
@@ -34,7 +34,7 @@ VENDOR ?= $(if $(VENDOR_DETECTED),$(VENDOR_DETECTED),generic)
 .PHONY: help build up up-kernel up-host down down-rm down-host restart restart-host status status-host env vendor metrics http steps watch trace trace-host pyspy gpu-sample probe probe-deep probe-host suite suite-host compare report test host-check obs-up obs-down obs-logs clean-runs compose-check compose-up compose-down
 
 help: ## 显示全部可用目标
-	@echo "vllm-docker-probe 常用目标（RUNTIME=docker|host，默认 docker）："
+	@echo "llm-engine-probe 常用目标（RUNTIME=docker|host，默认 docker）："
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 	  awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 	@echo

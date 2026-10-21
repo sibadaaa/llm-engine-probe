@@ -17,7 +17,7 @@
 ## 1. 安装前：手工验证同一组模板
 
 ```bash
-cd /path/to/vllm-docker-probe
+cd /path/to/llm-engine-probe
 
 # ① 只看叠加结果，不启动
 hosts/vllm-host.sh show vendor/hygon scenario/tp4-prod spec/dflash
@@ -52,7 +52,7 @@ HOST_TEMPLATES="vendor/hygon scenario/tp4-prod spec/dflash" \
 | 占位符 | 改成 |
 |---|---|
 | `User=me` | 运行 vLLM 的非 root 用户（能访问 GPU 设备/模型盘） |
-| `WorkingDirectory=/home/me/vllm-docker-probe` | 你的仓库绝对路径 |
+| `WorkingDirectory=/home/me/llm-engine-probe` | 你的仓库绝对路径 |
 | `ExecStart=/home/me/.../hosts/vllm-host.sh up` | 同一路径下的入口脚本 |
 | `ExecStop=/home/me/.../hosts/vllm-host.sh down` | 同上 |
 | `Documentation=file:///home/me/...` | 可选，改成你的 README 路径 |

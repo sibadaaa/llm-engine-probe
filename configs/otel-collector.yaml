@@ -1,5 +1,5 @@
 # ============================================================================
-# OpenTelemetry Collector (contrib) 配置 — vllm-docker-probe 可选链路追踪
+# OpenTelemetry Collector (contrib) 配置 — llm-engine-probe 可选链路追踪
 #
 # 【vLLM 侧必须这样启动】否则 collector 收不到任何 span：
 #   --otlp-traces-endpoint http://otel-collector:4317

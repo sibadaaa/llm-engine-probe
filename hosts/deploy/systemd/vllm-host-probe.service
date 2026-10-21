@@ -26,8 +26,8 @@
 #       ExecStart（或外面再套 supervisor），探针侧只负责生成配置与做探测。
 # ============================================================================
 [Unit]
-Description=vLLM host-mode probe instance (vllm-docker-probe)
-Documentation=file:///home/me/vllm-docker-probe/hosts/deploy/systemd/README.md
+Description=vLLM host-mode probe instance (llm-engine-probe)
+Documentation=file:///home/me/llm-engine-probe/hosts/deploy/systemd/README.md
 After=network-online.target
 Wants=network-online.target
 
@@ -37,7 +37,7 @@ RemainAfterExit=yes
 
 # --- 使用前修改：运行用户与仓库路径（占位符） ------------------------------
 User=me
-WorkingDirectory=/home/me/vllm-docker-probe
+WorkingDirectory=/home/me/llm-engine-probe
 
 # 默认模板链：厂商 → 场景 → 投机解码（顺序有意义，后面的覆盖前面的）
 Environment="HOST_TEMPLATES=vendor/hygon scenario/tp4-prod spec/dflash"
@@ -61,9 +61,9 @@ TimeoutStopSec=90
 KillMode=process
 Restart=no
 
-# --- 使用前修改：把 /home/me/vllm-docker-probe 换成你的仓库路径 -------------
-ExecStart=/home/me/vllm-docker-probe/hosts/vllm-host.sh up
-ExecStop=/home/me/vllm-docker-probe/hosts/vllm-host.sh down
+# --- 使用前修改：把 /home/me/llm-engine-probe 换成你的仓库路径 -------------
+ExecStart=/home/me/llm-engine-probe/hosts/vllm-host.sh up
+ExecStop=/home/me/llm-engine-probe/hosts/vllm-host.sh down
 
 [Install]
 WantedBy=multi-user.target

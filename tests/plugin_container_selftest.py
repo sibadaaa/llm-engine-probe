@@ -4,7 +4,7 @@
 vLLM 镜像都适用；hygon 需要在启动前 source DTK 环境脚本）：
 
     docker run --rm \\
-      -v /home/lyh/vllm-test/vllm-docker-probe:/opt/vllm-probe \\
+      -v /home/lyh/vllm-test/llm-engine-probe:/opt/vllm-probe \\
       <厂商设备参数...> <你的 vLLM 镜像> bash -lc '
         # hygon: . /opt/dtk/env.sh >/dev/null 2>&1
         export PYTHONPATH=/opt/vllm-probe

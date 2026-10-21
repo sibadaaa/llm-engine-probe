@@ -185,7 +185,7 @@ def request_once(
         headers = {
             "Content-Type": "application/json",
             "Accept": "text/event-stream" if stream else "application/json",
-            "User-Agent": "vllm-docker-probe/1.0",
+            "User-Agent": "llm-engine-probe/1.0",
         }
         # 只有配置了真实 key 才带 Authorization（无鉴权实例不再发占位 "Bearer EMPTY"）
         headers.update(cfg.auth_headers())

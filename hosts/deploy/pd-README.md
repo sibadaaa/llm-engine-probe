@@ -98,7 +98,7 @@ PD（Prefill/Decode Disaggregation）把一次请求拆成两段：
 ## 3. 先 dry-run（默认行为）
 
 ```bash
-cd /path/to/vllm-docker-probe
+cd /path/to/llm-engine-probe
 
 # ① 单独看两个模板的叠加结果（不启动）
 hosts/vllm-host.sh show deploy/pd-prefill

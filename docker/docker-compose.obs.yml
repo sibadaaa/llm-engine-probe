@@ -1,5 +1,5 @@
 # ============================================================================
-# vllm-docker-probe — 可选观测栈 overlay（Prometheus + Grafana + OTel Collector）
+# llm-engine-probe — 可选观测栈 overlay（Prometheus + Grafana + OTel Collector）
 #
 # 这是 docker/docker-compose.yml（base，定义 vllm 服务与 probe-net 网络）的
 # 叠加文件，本身不声明 networks（复用 base 的 probe-net），也没有 version 键。

@@ -1307,12 +1307,12 @@ def _section_artifacts(art: Artifacts) -> str:
             rows.append([f"`{path.name}`", fmt(path.stat().st_size / 1024.0, 1, " KiB")])
     lines.append(table(["文件", "大小"], rows))
     is_host = str(art.meta.get("runtime") or "docker").lower() == "host"
-    prelude = "# 物理机（host）模式：可先跑环境体检\nmake -C vllm-docker-probe host-check\n" if is_host else ""
+    prelude = "# 物理机（host）模式：可先跑环境体检\nmake -C llm-engine-probe host-check\n" if is_host else ""
     runtime_var = "RUNTIME=host " if is_host else ""
     lines.append(
         "\n复现命令（在项目根目录执行）：\n\n```bash\n"
         + prelude
-        + "make -C vllm-docker-probe " + runtime_var + "probe RUN_DIR=" + str(art.run_dir) + "\n```\n"
+        + "make -C llm-engine-probe " + runtime_var + "probe RUN_DIR=" + str(art.run_dir) + "\n```\n"
     )
     cmd = art.meta.get("command")
     if cmd:

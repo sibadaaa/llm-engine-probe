@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vllm-probe-stat-logger"
 version = "2.0.0"
-description = "vLLM stat logger plugin: dump per-engine-step SchedulerStats/IterationStats to JSONL (vllm-docker-probe)"
+description = "vLLM stat logger plugin: dump per-engine-step SchedulerStats/IterationStats to JSONL (llm-engine-probe)"
 requires-python = ">=3.10"
 # 刻意不声明依赖：本插件只用标准库 + vLLM 自身，离线环境也能装。
 dependencies = []

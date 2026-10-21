@@ -1,4 +1,7 @@
-# vllm-docker-probe · vLLM 推理全流程探测工具箱（多厂商）
+# llm-engine-probe · 大模型推理引擎探测工具箱（当前主 vLLM，多厂商）
+
+> 定位：引擎无关的推理探测/调优工具箱。当前实现以 vLLM 为主；后续计划支持
+> SGLang / TensorRT-LLM 等多引擎（探针与报告围绕 HTTP/OpenAI 兼容接口设计，引擎层通过适配器扩展）。
 
 在 Docker 中启动一个**可观测的 vLLM 实例**，并把一次推理从「HTTP 请求 → 调度排队 → 预填充 → 解码 → 投机解码验证 → GPU kernel」的**每一步**都采出来，最后汇总成一份中文 Markdown 报告，直接告诉你下一步该优化什么。
 
@@ -22,7 +25,7 @@
 ## 1. 快速开始（三步）
 
 ```bash
-cd /vllm-docker-probe
+cd /llm-engine-probe
 
 # ① 复制配置模板，按需修改（重点是 VENDOR / PORT / MODEL / PROBE_LEVEL）
 cp .env.example .env
@@ -121,7 +124,7 @@ PD 分离与多机骨架。叠加优先级、模板索引与新增模板约定�
 ## 2. 目录结构
 
 ```
-vllm-docker-probe/
+llm-engine-probe/
 ├── README.md                     ← 本文件（使用说明）
 ├── docs/观测字段对照表.md          ← 字段级参考：每一步有哪些指标/日志/事件
 ├── docs/物理机模式.md              ← 物理机（裸机）模式详细指南（RUNTIME=host）
