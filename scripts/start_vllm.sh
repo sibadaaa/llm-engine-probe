@@ -373,7 +373,11 @@ if runtime_is_host; then
     echo 'set -euo pipefail'
     printf 'cd %q\n' "$WORKDIR"
     if [[ -n "$HOST_PRELUDE" ]]; then
+      # 厂商 env.sh（DTK/CANN/oneAPI）常用裸 ${VAR}，不兼容 set -u；
+      # 只在 source prelude 期间临时关闭 nounset，之后恢复（否则 launcher 会立刻退出）。
+      echo 'set +u'
       printf '%s\n' "$HOST_PRELUDE"
+      echo 'set -u'
     else
       echo '# （HOST_PRELUDE_FILES 为空，跳过宿主机环境脚本）'
     fi
@@ -444,14 +448,17 @@ PY
 
   # stat logger 插件装到 run 目录（PYTHONPATH 已在 ENV_KVS 里指向 .probe_plugins）
   if [[ "$PROBE_PLUGIN" == "1" ]]; then
-    mkdir -p "$RUN_DIR/.probe_plugins"
+    mkdir -p "$RUN_DIR/.probe_plugins" "$RUN_DIR/.pip-tmp"
     # pip 从 pyproject 源码目录安装时会在源码树里生成 build/ 与 *.egg-info，先记录
     # 安装前的状态，安装后把「新出现」的清理掉，避免污染 git 工作区。
     PLUGIN_ARTIFACTS_BEFORE="$(ls -1d "$PROJECT_ROOT"/plugin_probe/build "$PROJECT_ROOT"/plugin_probe/*.egg-info 2>/dev/null || true)"
     log "安装 stat logger 插件到 $RUN_DIR/.probe_plugins"
-    if "$(host_python)" -m pip install -q --no-deps --no-build-isolation \
+    # TMPDIR 必须与 --target 同文件系统：默认 /tmp（tmpfs）与仓库跨设备时，
+    # pip 构建 wheel 会报 OSError: Invalid cross-device link。
+    if TMPDIR="$RUN_DIR/.pip-tmp" "$(host_python)" -m pip install -q --no-deps --no-build-isolation \
         --target "$RUN_DIR/.probe_plugins" "$PROJECT_ROOT/plugin_probe" >/dev/null 2>&1; then
       ok "stat logger 插件已安装（$RUN_DIR/.probe_plugins）"
+      rm -rf "$RUN_DIR/.pip-tmp"   # 安装成功即清理临时目录；失败时保留便于排查
     else
       warn "stat logger 插件安装失败（不影响推理，仅缺 JSONL）"
     fi

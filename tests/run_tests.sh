@@ -4,6 +4,7 @@
 #   2) 脚本语法检查（bash -n）
 #   3) 对本地 mock vLLM 服务跑一遍完整链路（无需 GPU/Docker）
 #   4) 物理机（RUNTIME=host）模式自测（假入口，无需 GPU/vLLM/Docker）
+#   5) 物理机启动模板自测（hosts/*/*.env：语法/键名/叠加/dry-run，无需 GPU/vLLM/Docker）
 #
 # 用法：bash tests/run_tests.sh
 
@@ -21,13 +22,13 @@ check() {
 }
 
 # ---------------------------------------------------------------------------
-step "1/4 单元测试"
+step "1/5 单元测试"
 if python3 -m unittest discover -s tests -v; then check 0 "unittest 全部通过"; else check 1 "unittest 有失败"; fi
 
 # ---------------------------------------------------------------------------
-step "2/4 脚本语法检查（bash -n）"
+step "2/5 脚本语法检查（bash -n）"
 SYNTAX_OK=0
-for script in scripts/*.sh scripts/lib/*.sh vendors/*.sh tests/run_tests.sh tests/host_mode_selftest.sh; do
+for script in scripts/*.sh scripts/lib/*.sh vendors/*.sh tests/run_tests.sh tests/host_mode_selftest.sh tests/host_templates_selftest.sh; do
   if bash -n "$script" 2>/tmp/bashn.err; then
     printf '  ok   %s\n' "$script"
   else
@@ -37,7 +38,7 @@ done
 check $SYNTAX_OK "全部脚本语法正确"
 
 # ---------------------------------------------------------------------------
-step "3/4 mock 服务端到端（无 GPU 依赖）"
+step "3/5 mock 服务端到端（无 GPU 依赖）"
 PORT="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
 RUN="/tmp/probe-e2e-$$"
 mkdir -p "$RUN/traces"
@@ -169,8 +170,12 @@ grep -q "自动归因与优化建议" "$RUN/REPORT.md" && check 0 "报告包含�
 grep -q "stat logger 插件" "$RUN/REPORT.md" && check 0 "报告包含插件结构化数据一节" || check 1 "报告缺插件一节"
 
 # ---------------------------------------------------------------------------
-step "4/4 物理机（host）模式自测"
+step "4/5 物理机（host）模式自测"
 if bash tests/host_mode_selftest.sh; then check 0 "host 模式自测全部通过"; else check 1 "host 模式自测有失败"; fi
+
+# ---------------------------------------------------------------------------
+step "5/5 物理机启动模板自测（hosts/*/*.env）"
+if bash tests/host_templates_selftest.sh; then check 0 "host 模板自测全部通过"; else check 1 "host 模板自测有失败"; fi
 
 echo
 echo "产物示例：$RUN/REPORT.md"

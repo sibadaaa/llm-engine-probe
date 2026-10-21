@@ -82,6 +82,20 @@ make suite-host          # 标准化 8 场景 → suite_results.json
 make compare A=runs/<docker>/suite_results.json B=runs/<host>/suite_results.json
 ```
 
+**启动模板（换厂商/换场景不用手改 `.env`）**：物理机模板独立放在 [`hosts/`](hosts/README.md)，
+按「厂商 → 场景 → 量化/投机 → 部署形态」叠加，不侵入 `scripts/start_vllm.sh` 的启动逻辑：
+
+```bash
+hosts/vllm-host.sh list                                      # 全部模板
+hosts/vllm-host.sh show vendor/hygon scenario/tp4-prod spec/dflash
+hosts/vllm-host.sh up   vendor/hygon scenario/tp4-prod spec/dflash   # 预检→启动
+hosts/vllm-host.sh probe vendor/hygon scenario/tp4-prod      # 复用同一套探针
+```
+
+覆盖厂商（nvidia/amd/hygon/intel/ascend）、场景（单卡调试/TP4 生产/TP8 吞吐/128K 长上下文）、
+量化（FP8/INT8 W8A8/W4A16/AWQ）与投机解码（dflash/mtp/eagle/ngram），另有 systemd、外部实例只读探测、
+PD 分离与多机骨架。叠加优先级、模板索引与新增模板约定见 [`hosts/README.md`](hosts/README.md)。
+
 | 事项 | Docker 模式 | 物理机（host）模式 |
 |---|---|---|
 | 启动 | `make up`（内部 `docker run`） | `make up-host`（本机 `HOST_PYTHON` 起 vLLM CLI） |
@@ -117,6 +131,11 @@ vllm-docker-probe/
 │   ├── README.md                 ← 新增一家厂商的完整指南
 │   ├── _template.sh              ← 适配模板（含每个变量说明）
 │   └── <vendor>.sh               ← 设备直通/环境注入/SMI 命令/探测元数据
+├── hosts/                        ← 物理机启动模板（厂商/场景/量化/投机/部署；模板不侵入核心）
+│   ├── vllm-host.sh              ← 模板入口：list/show/check/dry-run/up/down/status/probe/...
+│   ├── README.md                 ← 模板索引、叠加规则、新增模板约定
+│   ├── vendor/ scenario/ quant/ spec/  ← 各类 .env 模板
+│   └── deploy/                   ← systemd、外部实例只读探测、PD/多机骨架
 ├── docker/
 │   ├── Dockerfile                ← 探针就绪镜像（叠加在任意厂商的 vLLM 基础镜像上）
 │   ├── docker-compose.yml        ← 容器壳定义（厂商中立）
@@ -145,7 +164,7 @@ vllm-docker-probe/
 │   ├── probe_all.sh report.sh build_image.sh
 │   └── lib/common.sh             ← 配置 + 厂商检测 + 运行时（docker/host）辅助
 ├── samples/                      ← 真实日志/指标/profiler/SMI 样例（测试用）
-├── tests/                        ← 单元测试 + mock 服务 + 端到端自测 + host 模式自测
+├── tests/                        ← 单元测试 + mock 服务 + 端到端自测 + host 模式/模板自测
 └── runs/<时间戳>/                 ← 每次探测的全部产物（报告就在这）
 ```
 

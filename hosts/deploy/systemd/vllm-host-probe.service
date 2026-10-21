@@ -1,0 +1,69 @@
+# ============================================================================
+# vLLM 物理机常驻示例（systemd），配合 hosts/vllm-host.sh 使用。
+#
+# ⚠️ 使用前必须修改下面 4 处占位符（/home/me、User=me）：
+#   1) WorkingDirectory=          你的仓库绝对路径
+#   2) ExecStart=/ExecStop=       同一路径下的 hosts/vllm-host.sh
+#   3) User=                      运行 vLLM 的非 root 用户（需能访问模型/GPU 设备）
+#   4) 如需要，取消注释 Environment=HOST_PYTHON=...（每台机器不同，
+#      hosts/*.env 模板刻意不设置 HOST_PYTHON）
+#
+# 建议先手工验证（不要直接 systemctl start）：
+#   cd <仓库> && HOST_TEMPLATES="vendor/hygon scenario/tp4-prod spec/dflash" \
+#     hosts/vllm-host.sh show vendor/hygon scenario/tp4-prod spec/dflash
+#   HOST_TEMPLATES="..." hosts/vllm-host.sh up
+#   HOST_TEMPLATES="..." hosts/vllm-host.sh down
+# 安装/启用/排错见同目录 README.md；原理见 docs/物理机模式.md §10。
+#
+# 为什么 Type=oneshot + RemainAfterExit=yes：
+#   hosts/vllm-host.sh up 会等 /health 就绪后**返回**，vLLM 进程由 setsid 放到
+#   后台（PID 记在 <RUN_DIR>/serve.pid），systemd 不直接跟踪它。因此：
+#     * systemd 认为服务 active（RemainAfterExit），停止时走 ExecStop；
+#     * KillMode=process：只给 ExecStart 的主进程发信号，不误杀 setsid 出来的
+#       vLLM 进程组（优雅停止由 stop_vllm.sh 负责）；
+#     * Restart=no：与 docs/物理机模式.md §10 一致，本模板**不会**在 vLLM 崩溃时
+#       自动拉起。要自动重启，请把 <RUN_DIR>/serve_launch.sh 的内容作为真正的
+#       ExecStart（或外面再套 supervisor），探针侧只负责生成配置与做探测。
+# ============================================================================
+[Unit]
+Description=vLLM host-mode probe instance (vllm-docker-probe)
+Documentation=file:///home/me/vllm-docker-probe/hosts/deploy/systemd/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# --- 使用前修改：运行用户与仓库路径（占位符） ------------------------------
+User=me
+WorkingDirectory=/home/me/vllm-docker-probe
+
+# 默认模板链：厂商 → 场景 → 投机解码（顺序有意义，后面的覆盖前面的）
+Environment="HOST_TEMPLATES=vendor/hygon scenario/tp4-prod spec/dflash"
+
+# 每台机器的解释器不同：HOST_PYTHON 必须能在 systemd 的最小环境里执行。
+# Environment="HOST_PYTHON=/home/me/venv-vllm/bin/python"
+# DTK/Ascend 等厂商环境脚本也必须显式写进 unit（systemd 不读登录 shell 的 profile）。
+# Environment="HOST_PRELUDE_FILES=DTK_ROOT=/opt/dtk2604 /opt/dtk/env.sh"
+# 同机还有其它显存占用/调试时，可跳过停止后的显存回落等待（docs §5.2）：
+# Environment=PROBE_SKIP_VRAM_WAIT=1
+
+# 等价于 docker run 的 --ulimit / --shm-size 限制（docs §2.5 / §10）
+LimitMEMLOCK=infinity
+LimitSTACK=infinity
+LimitNOFILE=65535
+
+# start_vllm.sh 会等 /health 就绪后返回；大模型冷启动可能 5~15 分钟。
+# start_vllm.sh 停止时默认还要等显存回落（最长约 60s），所以 Stop 给 90s。
+TimeoutStartSec=1200
+TimeoutStopSec=90
+KillMode=process
+Restart=no
+
+# --- 使用前修改：把 /home/me/vllm-docker-probe 换成你的仓库路径 -------------
+ExecStart=/home/me/vllm-docker-probe/hosts/vllm-host.sh up
+ExecStop=/home/me/vllm-docker-probe/hosts/vllm-host.sh down
+
+[Install]
+WantedBy=multi-user.target
