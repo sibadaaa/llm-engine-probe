@@ -92,6 +92,7 @@ EXPECTED_TEMPLATES=(
   quant/fp8 quant/int8-w8a8 quant/w4a16 quant/awq
   spec/dflash spec/mtp spec/eagle spec/ngram
   deploy/pd-prefill deploy/pd-decode deploy/multinode-head deploy/multinode-worker
+  engine/vllm engine/strata
 )
 have_template() { # $1=模板名（如 vendor/hygon）
   [[ -f "hosts/$1.env" ]]
@@ -379,9 +380,11 @@ else
     ["spec/ngram"]='"model":"[ngram]"'
     ["spec/mtp"]='"method":"mtp"'
     ["quant/fp8"]='--quantization fp8'
+    ["engine/strata"]='ENGINE=strata'
   )
   declare -A DRY_EXPECT_DESC2=(
     ["spec/ngram"]='"method":"ngram"'
+    ["engine/strata"]='strata launch'
   )
 
   for name in "${TEMPLATE_NAMES[@]}"; do
@@ -401,17 +404,27 @@ else
     launch="$(ls -1dt "$rdir"/*/serve_launch.sh 2>/dev/null | head -n 1)"
     if [[ -n "$launch" && -f "$launch" ]]; then
       chk_pass "dry-run $name 生成 serve_launch.sh"
-      if [[ "$launch" == "$rdir"/* ]] \
-        && grep -qE '(^|[[:space:]])serve([[:space:]]|$)' "$launch" \
-        && { grep -qF -- "$DRY_MODEL" "$launch" || grep -qF -- '--model' "$launch"; }; then
-        # vLLM 的模型是 serve 的位置参数（不是 --model 开关）；这里同时接受
-        # 显式模型路径（MODEL=$DRY_MODEL 必须传导到命令里）和 --model 写法。
-        chk_pass "dry-run $name 的 serve_launch.sh 含 serve 与模型路径（$DRY_MODEL）"
+      # 引擎感知断言：vLLM CLI（ENGINE_ARGS_MODE=vllm-cli）的模型是 serve 位置参数；
+      # custom 模式引擎（如 strata）无 serve 子命令语义，模型身份记录在 export 段。
+      launch_engine="$(sed -n -E 's/^export ENGINE=//p' "$launch" | head -n 1)"
+      launch_engine="${launch_engine:-vllm}"
+      if [[ "$launch_engine" == "vllm" ]]; then
+        if [[ "$launch" == "$rdir"/* ]] \
+          && grep -qE '(^|[[:space:]])serve([[:space:]]|$)' "$launch" \
+          && { grep -qF -- "$DRY_MODEL" "$launch" || grep -qF -- '--model' "$launch"; }; then
+          # vLLM 的模型是 serve 的位置参数（不是 --model 开关）；这里同时接受
+          # 显式模型路径（MODEL=$DRY_MODEL 必须传导到命令里）和 --model 写法。
+          chk_pass "dry-run $name 的 serve_launch.sh 含 serve 与模型路径（$DRY_MODEL）"
+        else
+          chk_fail "dry-run $name 的 serve_launch.sh 缺 serve 或模型路径 $DRY_MODEL（$launch）"; dump_tail "$launch"
+        fi
+      elif grep -qF -- "$DRY_MODEL" "$launch" || grep -qE '^export MODEL=' "$launch"; then
+        chk_pass "dry-run $name 的 serve_launch.sh 记录了模型身份（engine=$launch_engine，custom 模式）"
       else
-        chk_fail "dry-run $name 的 serve_launch.sh 缺 serve 或模型路径 $DRY_MODEL（$launch）"; dump_tail "$launch"
+        chk_fail "dry-run $name 的 serve_launch.sh 缺模型身份（export MODEL 或命令行；engine=$launch_engine）"; dump_tail "$launch"
       fi
       case "$name" in
-        vendor/hygon|scenario/tp4-prod|spec/dflash|spec/ngram|spec/mtp|quant/fp8)
+        vendor/hygon|scenario/tp4-prod|spec/dflash|spec/ngram|spec/mtp|quant/fp8|engine/strata)
           desc="${DRY_EXPECT_DESC[$name]}"
           if file_contains_fragment "$launch" "$desc"; then
             chk_pass "$name 的 serve_launch.sh 含 $desc"
@@ -442,17 +455,84 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 5b) 引擎组件守卫：未知 ENGINE 必须 die 且文案列出可用引擎（F1 T1.11）
+# ---------------------------------------------------------------------------
+echo
+echo "---- 5b) 引擎组件守卫（ENGINE） ----"
+GUARD_OUT="$TMP/engine-guard.out"
+guard_rc=0
+RUNS_DIR="$RUNS_BASE/engine-guard" MODEL="$DRY_MODEL" HOST_PYTHON=python3 ENGINE=no-such-engine \
+  bash hosts/vllm-host.sh dry-run vendor/hygon > "$GUARD_OUT" 2>&1 || guard_rc=$?
+if [[ $guard_rc -ne 0 ]] && grep -q '未知引擎' "$GUARD_OUT" && grep -qw 'vllm' "$GUARD_OUT"; then
+  chk_pass "ENGINE=no-such-engine 的 dry-run 被拒绝且文案列出可用引擎"
+else
+  chk_fail "ENGINE=no-such-engine 未按预期失败（退出码 $guard_rc，文案需含「未知引擎」与引擎列表）"
+  dump_tail "$GUARD_OUT"
+fi
+
+# engine/vllm 模板：显式声明 vLLM ≡ 不设置（红线 1：引擎模板不得改变默认路径行为）。
+# 断言走 show（ENGINE=vllm 显示），dry-run 产物保持与「不设置」逐字节一致。
+if have_template engine/vllm; then
+  ENG_OUT="$TMP/engine-vllm-show.out"
+  bash hosts/vllm-host.sh show engine/vllm > "$ENG_OUT" 2>&1 || true
+  eng_seen="$(show_value_tidy ENGINE < "$ENG_OUT")"
+  if [[ "$eng_seen" == "vllm" ]]; then
+    chk_pass "engine/vllm 模板 show 显示 ENGINE=vllm（占位声明生效）"
+  else
+    chk_fail "engine/vllm 模板 show 未显示 ENGINE=vllm（实际：${eng_seen:-<空>}）"
+  fi
+fi
+
+# 引擎无 docker 能力时，RUNTIME=docker 必须 die 且文案含 "docker"（F2 T2.3）。
+# 注意：hosts/vllm-host.sh 是物理机入口、恒以 --host 调 start_vllm.sh，
+# 因此 docker 门禁用 scripts/start_vllm.sh 直调验证。
+STRAITA_OUT="$TMP/engine-strata-docker.out"
+strata_docker_rc=0
+if have_template engine/strata; then
+  RUNTIME=docker ENGINE=strata RUNS_DIR="$RUNS_BASE/engine-strata-docker" MODEL="$DRY_MODEL" \
+    bash scripts/start_vllm.sh --dry-run > "$STRAITA_OUT" 2>&1 || strata_docker_rc=$?
+  if [[ $strata_docker_rc -ne 0 ]] && grep -q 'docker' "$STRAITA_OUT"; then
+    chk_pass "ENGINE=strata RUNTIME=docker 被拒绝且文案含 docker（无 runtime.docker 能力）"
+  else
+    chk_fail "ENGINE=strata RUNTIME=docker 未按预期失败（退出码 $strata_docker_rc）"
+    dump_tail "$STRAITA_OUT"
+  fi
+
+  # 无 api.openai-completions 能力的引擎：PROBE_ENDPOINT=completions 必须 die（F2 T2.6②）
+  STRATA_CP_OUT="$TMP/engine-strata-completions.out"
+  strata_cp_rc=0
+  RUNTIME=host ENGINE=strata RUNS_DIR="$RUNS_BASE/engine-strata-completions" \
+    PROBE_ENDPOINT=completions MODEL="$DRY_MODEL" HOST_PYTHON=python3 \
+    bash hosts/vllm-host.sh dry-run engine/strata > "$STRATA_CP_OUT" 2>&1 || strata_cp_rc=$?
+  if [[ $strata_cp_rc -ne 0 ]] && grep -q 'completions' "$STRATA_CP_OUT"; then
+    chk_pass "ENGINE=strata + PROBE_ENDPOINT=completions 被拒绝（无 api.openai-completions 能力）"
+  else
+    chk_fail "ENGINE=strata + PROBE_ENDPOINT=completions 未按预期失败（退出码 $strata_cp_rc）"
+    dump_tail "$STRATA_CP_OUT"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # 6) 核心脚本改动范围（模板本身不要求改核心；只允许 host prelude 的 set +u 兼容修复）
 # ---------------------------------------------------------------------------
 echo
 echo "---- 6) 核心脚本改动范围 ----"
 if git rev-parse --is-inside-work-tree > /dev/null 2>&1; then
   dirty="$(git status --porcelain -- scripts/ 2>/dev/null || true)"
+  # 允许的 scripts/ 改动白名单（docs/design/component-interface/施工图.md T1.1）：
+  #   start_vllm.sh  : host prelude set +u 兼容修复 + 引擎 caps 门禁收拢（F1 T1.7）
+  #   lib/common.sh  : 引擎组件层加载函数 / 进程正则参数化 / 身份落产物（T1.6/T1.8/T1.9）
+  #                    + 就绪等待共享函数 wait_engine_ready（F3 评审修复）
+  #   stop_vllm.sh   : docker --kill-exec 分支进程正则参数化（T1.8）
+  #   status.sh      : 引擎版本探测与 /metrics 抓取后缀（T1.9 / F3 T3.6）
+  #   pyspy.sh       : 容器内进程 grep 正则参数化（T1.8）
+  #   wait_ready.sh  : 就绪判定改走共享的 wait_engine_ready（引擎感知，F3 评审修复）
+  # 新增其它 scripts/ 改动时必须先扩这份白名单并同步 hosts/README.md §6。
   unexpected="$(printf '%s\n' "$dirty" \
-    | grep -vE '^.. scripts/start_vllm\.sh$' \
+    | grep -vE '^.. scripts/(start_vllm\.sh|lib/common\.sh|stop_vllm\.sh|status\.sh|pyspy\.sh|wait_ready\.sh)$' \
     | grep -v '^$' || true)"
   if [[ -z "$unexpected" ]]; then
-    chk_pass "scripts/ 无额外改动（允许 start_vllm.sh 的 prelude set +u 兼容修复）"
+    chk_pass "scripts/ 无额外改动（白名单：start_vllm / lib-common / stop_vllm / status / pyspy）"
     if [[ -n "$dirty" ]]; then
       printf '      允许的改动：\n'
       printf '%s\n' "$dirty" | sed 's/^/        /'

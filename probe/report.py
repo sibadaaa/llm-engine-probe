@@ -154,6 +154,8 @@ TITLE = "vLLM 推理全流程探测报告"
 def build_report(run_dir: str | Path, title: str = TITLE) -> str:
     art = Artifacts.scan(run_dir)
     parts: list[str] = [f"# {title}\n"]
+    # 引擎行（F3 T3.4）：标题下方注明本次探测的引擎组件
+    parts.append(f"\n引擎：{_engine_label(art)}\n")
     parts.append(_section_overview(art))
     parts.append(_section_env(art))
     parts.append(_section_http(art))
@@ -188,6 +190,57 @@ def _vendor_label(art: Artifacts) -> str:
         except KeyError:
             return vendor
     return "—"
+
+
+def _artifact_engine(art: Artifacts) -> str:
+    """引擎组件 id：run_meta.json 的 meta.engine（T1.9 写入）→ ENGINE 环境变量 → vllm。"""
+    meta_engine = str(art.meta.get("engine") or "").strip()
+    if meta_engine:
+        return meta_engine
+    return str(os.environ.get("ENGINE") or "vllm").strip() or "vllm"
+
+
+def _engine_label(art: Artifacts) -> str:
+    """引擎展示名：run_meta 的 engine_label → 注册表 label → 原始 id。"""
+    label = str(art.meta.get("engine_label") or "").strip()
+    engine = _artifact_engine(art)
+    if label:
+        return label
+    if engine:
+        try:
+            from .engines import get_engine
+
+            return get_engine(engine).label
+        except KeyError:
+            return engine
+    return "—"
+
+
+def _engine_profile_for_art(art: Artifacts):
+    """报告用的引擎 profile（id 非法时回落 vllm，绝不让报告崩栈）。"""
+    from .engines import get_engine
+
+    try:
+        return get_engine(_artifact_engine(art))
+    except KeyError:
+        return get_engine("vllm")
+
+
+def _engine_has_cap(art: Artifacts, cap: str) -> bool:
+    from .engines import has_cap
+
+    return has_cap(_engine_profile_for_art(art), cap)
+
+
+def _engine_cap_note(art: Artifacts, cap: str, text: str) -> str:
+    """能力降级注记：引擎缺某能力时给一句说明（替代空白小节）；有能力时返回空。
+
+    vLLM 拥有全部 obs.* 能力，因此本函数对 vLLM 基线恒返回 ""（文案逐字一致）。
+    """
+    if _engine_has_cap(art, cap):
+        return ""
+    profile = _engine_profile_for_art(art)
+    return f"引擎 {profile.label} {text}（无 {cap} 能力），本节为空。\n"
 
 
 def _smi_hint(art: Artifacts) -> str:
@@ -241,6 +294,8 @@ def _section_overview(art: Artifacts) -> str:
         ["运行目录", str(art.run_dir)],
         ["时间", meta.get("started_at", "—")],
         ["厂商", _vendor_label(art) + (f"（{_artifact_vendor(art)}）" if _artifact_vendor(art) else "")],
+        # 引擎行（F3 T3.4）：紧跟厂商行；解析模式复用 _artifact_vendor/_vendor_label 的结构
+        ["引擎", _engine_label(art) + (f"（{_artifact_engine(art)}）" if _artifact_engine(art) else "")],
         *_runtime_rows(meta),
         ["模型", meta.get("model", "—")],
         ["服务名", meta.get("served_name", "—")],
@@ -475,6 +530,11 @@ def _section_steps(art: Artifacts) -> str:
     s = art.steps_summary
     plugin = art.plugin_summary
     if not s and not plugin:
+        # 能力降级注记（F3 T3.4）：引擎无逐 step 观测能力时用一句说明替代空白；
+        # vLLM 拥有 obs.step-log 能力 → 恒为 ""（基线不变）。
+        note = _engine_cap_note(art, "obs.step-log", "不支持逐 step 日志/插件观测")
+        if note:
+            return "## 3. 引擎 step 级（`--enable-logging-iteration-details`）\n\n_" + note + "_\n"
         return ""
     if not s:
         return (
@@ -613,6 +673,9 @@ def _section_schedule(art: Artifacts) -> str:
     hits, queries = total("vllm:prefix_cache_hits_total"), total("vllm:prefix_cache_queries_total")
     hit_rate = (hits / queries * 100.0) if hits is not None and queries else None
     lines = ["## 4. 调度 / 队列 / KV 缓存\n"]
+    # 引擎注记（F3 T3.4）：profile report_notes 挂在节头（vLLM 为空 → 基线不变）
+    for note in _engine_profile_for_art(art).report_notes:
+        lines.append(f"\n> 引擎注记：{note}\n")
     rows = [
         ["运行中请求", fmt(gauge("vllm:num_requests_running"))],
         ["等待中请求", fmt(gauge("vllm:num_requests_waiting"))],
@@ -623,6 +686,18 @@ def _section_schedule(art: Artifacts) -> str:
         ["其中命中缓存", fmt(total("vllm:prompt_tokens_cached_total"), 0)],
         ["generation token 总数", fmt(total("vllm:generation_tokens_total"), 0)],
     ]
+    # 引擎专有指标（F3 T3.8）：--engine-extras 开启且快照带 engine_extra 段时展示；
+    # 默认关闭（无该段）时本行不出现，产物 schema 不变。
+    # 命中率族名按引擎 id 派生（<id>:last_hit_rate），不硬编码引擎名——
+    # 新引擎只要按该约定提供族并声明在 extra_metric_families 里即可展示。
+    extra = ((art.metrics_after or art.metrics_before or {}).get("meta") or {}).get("engine_extra") or {}
+    hit_fam = (extra.get("families") or {}).get(f"{_engine_profile_for_art(art).id}:last_hit_rate")
+    if hit_fam and hit_fam.get("series"):
+        value = hit_fam["series"][0].get("value")
+        rows.append([
+            "专家缓存命中率（引擎侧）",
+            f"{fmt(value * 100)}%" if isinstance(value, (int, float)) else fmt(value),
+        ])
     waiting_by_reason = [
         s for s in (families.get("vllm:num_requests_waiting_by_reason") or {}).get("series", [])
     ]
@@ -679,8 +754,18 @@ def _section_spec(art: Artifacts) -> str:
     spec = steps.get("spec_decode") or {}
     http_spec = ((art.http_summary or {}).get("spec_decode") or {})
     if not spec.get("available") and not http_spec.get("available"):
+        # 能力降级注记（F3 T3.4）：引擎无逐请求投机指标时说明仅有 /metrics 级计数器
+        note = _engine_cap_note(
+            art, "obs.per-request-metrics",
+            "不提供逐请求投机解码指标归因（仅有 /metrics 级 draft/accepted 计数器，如引擎提供）",
+        )
+        if note:
+            return "## 5. 投机解码（草稿模型 / MTP）\n\n_" + note + "_\n"
         return ""
     lines = ["## 5. 投机解码（草稿模型 / MTP）\n"]
+    if not http_spec.get("available") and not _engine_has_cap(art, "obs.per-request-metrics"):
+        lines.append("_仅含引擎日志口径；该引擎不提供逐请求投机解码指标"
+                     "（仅有 /metrics 级计数器，如引擎提供）。_\n")
     rows: list[list[Any]] = []
     if spec.get("available"):
         rows.append(
@@ -794,6 +879,11 @@ def _section_memory(art: Artifacts) -> str:
 
 def _section_kernels(art: Artifacts) -> str:
     trace = art.trace_summary
+    if not trace:
+        # 能力降级注记（F3 T3.4）：引擎无 torch profiler 面板时 kernel 归因不适用
+        note = _engine_cap_note(art, "obs.trace-pytorch", "无 torch profiler 面板，kernel 归因不适用")
+        if note:
+            return "## 7. 算子 / kernel 级（torch profiler）\n\n_" + note + "_\n"
     lines: list[str] = []
     if trace:
         lines.append("## 7. 算子 / kernel 级（torch profiler）\n")
@@ -951,8 +1041,10 @@ DEFAULT_THRESHOLDS: dict[str, float] = {
 }
 
 
-def thresholds_for(vendor: str | None) -> dict[str, float]:
-    """默认阈值 + 厂商覆盖（probe/vendors.py::VendorProfile.diagnose_overrides）。"""
+def thresholds_for(vendor: str | None = None, engine_profile: Any = None) -> dict[str, float]:
+    """默认阈值 + 厂商覆盖（probe/vendors.py::VendorProfile.diagnose_overrides）
+    + 引擎覆盖（probe/engines.py::EngineProfile.diagnose_overrides，F3 T3.4，
+    在厂商覆盖之后合并——引擎与厂商正交，引擎优先级更高）。"""
     thresholds = dict(DEFAULT_THRESHOLDS)
     if vendor:
         try:
@@ -960,6 +1052,11 @@ def thresholds_for(vendor: str | None) -> dict[str, float]:
 
             thresholds.update(get_vendor(vendor).diagnose_overrides)
         except KeyError:
+            pass
+    if engine_profile is not None:
+        try:
+            thresholds.update(dict(engine_profile.diagnose_overrides or {}))
+        except (AttributeError, TypeError, ValueError):
             pass
     return thresholds
 
@@ -972,7 +1069,20 @@ def diagnose(art: Artifacts) -> list[Finding]:
     after = art.metrics_after or art.metrics_before or {}
     families = after.get("families", {})
     vendor = _artifact_vendor(art)
-    th = thresholds_for(vendor or None)
+    # 引擎组件（F3 T3.4）：诊断逻辑与阈值不动；engine != vllm 时建议文案里的
+    # vLLM CLI flag 替换为 profile report_notes 的一句话。
+    engine_profile = _engine_profile_for_art(art)
+    engine_is_vllm = engine_profile.id == "vllm"
+    engine_note = "；".join(engine_profile.report_notes) or (
+        f"引擎 {engine_profile.label} 的调优机制与 vLLM 不同，vLLM CLI flag 建议不适用；"
+        "请参考引擎文档与 `python3 -m probe engine` 输出的能力位/注记。"
+    )
+    th = thresholds_for(vendor or None, engine_profile=engine_profile)
+
+    def engine_action(text: str) -> str:
+        """建议文案引擎化：vLLM 引擎原样返回（基线逐字一致），其它引擎给引擎注记。"""
+        return text if engine_is_vllm else engine_note
+
     smi_name = _smi_hint(art)
     graph_label = "HIP/CUDA Graph"
     if vendor:
@@ -1005,9 +1115,11 @@ def diagnose(art: Artifacts) -> list[Finding]:
                 "高",
                 "队列等待偏高，请求在 WAITING 队列里被卡住",
                 f"服务端 queue_time p90={queue_p90:.1f} ms，running={running}，waiting={waiting}",
-                "提高 `--max-num-seqs` / `--max-num-batched-tokens`（注意 KV 余量），"
-                "或降低单请求 `max_tokens`；若 waiting 的 reason=capacity 说明是调度容量限制，"
-                "reason=deferred 说明是 LoRA / KV 传输等瞬时约束",
+                engine_action(
+                    "提高 `--max-num-seqs` / `--max-num-batched-tokens`（注意 KV 余量），"
+                    "或降低单请求 `max_tokens`；若 waiting 的 reason=capacity 说明是调度容量限制，"
+                    "reason=deferred 说明是 LoRA / KV 传输等瞬时约束"
+                ),
             )
         )
     preemptions = total("vllm:num_preemptions_total")
@@ -1018,8 +1130,10 @@ def diagnose(art: Artifacts) -> list[Finding]:
                 "高",
                 "KV 缓存压力大，出现抢占或接近打满",
                 f"抢占={preemptions:.0f} 次，KV 使用率={0 if kv_usage is None else kv_usage * 100:.1f}%",
-                "降低 `--max-model-len` 或并发；提高 `--gpu-memory-utilization`；"
-                "考虑 `--kv-cache-dtype fp8`；检查前缀缓存是否把长前缀长期占住",
+                engine_action(
+                    "降低 `--max-model-len` 或并发；提高 `--gpu-memory-utilization`；"
+                    "考虑 `--kv-cache-dtype fp8`；检查前缀缓存是否把长前缀长期占住"
+                ),
             )
         )
 
@@ -1043,9 +1157,11 @@ def diagnose(art: Artifacts) -> list[Finding]:
                 f"客户端 TTFT p90={client_ttft_p90:.0f} ms vs 服务端 TTFT p90={server_ttft_p90:.0f} ms"
                 f"（服务端 queue p90={queue_p90 if queue_p90 is None else round(queue_p90, 1)} ms），"
                 f"比值 {client_ttft_p90 / max(1.0, server_ttft_p90):.1f}×",
-                "容量评估以**客户端/网关侧 TTFT** 为准；`vllm:request_queue_time_seconds` 与逐请求 "
-                "`queue_time_ms` 只覆盖入队到首次调度，不包含「排在其他请求的预填充 chunk 之后」的等待。"
-                "排查方向：降低 `--max-num-batched-tokens`、限制单步预填充占比、或为长 prompt 单独分流。",
+                engine_action(
+                    "容量评估以**客户端/网关侧 TTFT** 为准；`vllm:request_queue_time_seconds` 与逐请求 "
+                    "`queue_time_ms` 只覆盖入队到首次调度，不包含「排在其他请求的预填充 chunk 之后」的等待。"
+                    "排查方向：降低 `--max-num-batched-tokens`、限制单步预填充占比、或为长 prompt 单独分流。"
+                ),
             )
         )
 
@@ -1059,9 +1175,11 @@ def diagnose(art: Artifacts) -> list[Finding]:
                 "解码 token 间隔出现秒级冻结：单个 step 的批次构成把所有解码流整段挡住",
                 f"客户端 ITL p99={itl_p99:.0f} ms，max={itl.get('max_ms')} ms，"
                 f"step 耗时 p99={fmt((steps.get('step_ms') or {}).get('p99'))} ms",
-                "step 是调度量子：一个 step 里塞进大块预填充 chunk 时，同一 step 内的解码请求必须等它算完。"
-                "把 `--max-num-batched-tokens` 调小（例如 8192→2048）可把秒级冻结压到亚秒级；"
-                "同时确认没有把长 prompt 与交互式解码混在同一实例上。",
+                engine_action(
+                    "step 是调度量子：一个 step 里塞进大块预填充 chunk 时，同一 step 内的解码请求必须等它算完。"
+                    "把 `--max-num-batched-tokens` 调小（例如 8192→2048）可把秒级冻结压到亚秒级；"
+                    "同时确认没有把长 prompt 与交互式解码混在同一实例上。"
+                ),
             )
         )
 
@@ -1075,8 +1193,10 @@ def diagnose(art: Artifacts) -> list[Finding]:
                     "中",
                     "前缀缓存命中率低，重复前缀没被复用",
                     f"命中率={rate * 100:.1f}%（hits={hits:.0f}/queries={queries:.0f}）",
-                    "确认启动参数含 `--enable-prefix-caching`；把 system prompt / few-shot 放在"
-                    "请求最前面并保持逐字节一致；长上下文场景可配合 `--kv-cache-metrics` 观察 block 复用间隔",
+                    engine_action(
+                        "确认启动参数含 `--enable-prefix-caching`；把 system prompt / few-shot 放在"
+                        "请求最前面并保持逐字节一致；长上下文场景可配合 `--kv-cache-metrics` 观察 block 复用间隔"
+                    ),
                 )
             )
         elif rate > th["prefix_hit_high"]:
@@ -1098,8 +1218,10 @@ def diagnose(art: Artifacts) -> list[Finding]:
                 "中",
                 "空转 step 占比高：引擎在无请求或等待中反复 step",
                 f"空转 {steps_info.get('idle')}/{steps_info.get('total')}（{idle_ratio * 100:.1f}%）",
-                "空转通常是低负载下的正常现象；若此时仍在压测，说明请求被调度限制，"
-                "检查 waiting 队列与 `--max-num-seqs`",
+                engine_action(
+                    "空转通常是低负载下的正常现象；若此时仍在压测，说明请求被调度限制，"
+                    "检查 waiting 队列与 `--max-num-seqs`"
+                ),
             )
         )
     regime = steps.get("regimes") or {}
@@ -1135,8 +1257,10 @@ def diagnose(art: Artifacts) -> list[Finding]:
                     "中",
                     "预填充吞吐偏低",
                     f"{per_1k:.0f} ms / 1k context token",
-                    "检查 `--max-num-batched-tokens` 是否把预填充切得过碎；"
-                    "确认 chunked prefill 与 attention 后端匹配；看 trace 中 Attention/GEMM 占比",
+                    engine_action(
+                        "检查 `--max-num-batched-tokens` 是否把预填充切得过碎；"
+                        "确认 chunked prefill 与 attention 后端匹配；看 trace 中 Attention/GEMM 占比"
+                    ),
                 )
             )
 
@@ -1196,8 +1320,10 @@ def diagnose(art: Artifacts) -> list[Finding]:
                     "中",
                     "集合通信占比偏高",
                     f"通信占比={comm['gpu_share'] * 100:.1f}%",
-                    "检查 TP/DP 切分是否过大、是否需要 `--disable-custom-all-reduce`、"
-                    "以及是否存在细碎 all-reduce（合并小通信）",
+                    engine_action(
+                        "检查 TP/DP 切分是否过大、是否需要 `--disable-custom-all-reduce`、"
+                        "以及是否存在细碎 all-reduce（合并小通信）"
+                    ),
                 )
             )
         if attn and attn.get("gpu_share", 0) > th["attn_share_high"]:
@@ -1218,8 +1344,10 @@ def diagnose(art: Artifacts) -> list[Finding]:
                     "GPU 时间线存在明显空洞，疑似 CPU 侧或同步等待",
                     f"GPU 利用率={util * 100:.1f}%，>1ms 空洞={trace.get('idle_gaps_over_1ms')} 个，"
                     f"最长空洞={trace.get('longest_gap_ms')} ms",
-                    "用 `scripts/pyspy.sh` 抓 Python 栈看是否卡在调度/后处理/日志；"
-                    "确认日志量级（iteration details 会放大 CPU 开销）；必要时关闭逐 iteration 日志复测",
+                    engine_action(
+                        "用 `scripts/pyspy.sh` 抓 Python 栈看是否卡在调度/后处理/日志；"
+                        "确认日志量级（iteration details 会放大 CPU 开销）；必要时关闭逐 iteration 日志复测"
+                    ),
                 )
             )
 
@@ -1233,8 +1361,10 @@ def diagnose(art: Artifacts) -> list[Finding]:
                     "中",
                     "投机解码接受长度低，草稿模型与目标模型分布不匹配",
                     f"平均接受长度={mean_len:.2f}（理论上限=k+1）",
-                    "考虑减小 k、换 draft 模型/温度对齐、或对草稿头做蒸馏适配；"
-                    "若位置 2 之后接受率≈0，说明只有第一个草稿 token 有效",
+                    engine_action(
+                        "考虑减小 k、换 draft 模型/温度对齐、或对草稿头做蒸馏适配；"
+                        "若位置 2 之后接受率≈0，说明只有第一个草稿 token 有效"
+                    ),
                 )
             )
         elif mean_len is not None and mean_len > th["accept_len_high"]:
@@ -1243,20 +1373,25 @@ def diagnose(art: Artifacts) -> list[Finding]:
                     "低",
                     "接受长度较高，可尝试增大 k 进一步摊薄解码步数",
                     f"平均接受长度={mean_len:.2f}",
-                    "在 `--speculative-config` 中增大 `num_speculative_tokens` 做 A/B，"
-                    "同时观察 GPU 时间是否被 verify pass 吃掉",
+                    engine_action(
+                        "在 `--speculative-config` 中增大 `num_speculative_tokens` 做 A/B，"
+                        "同时观察 GPU 时间是否被 verify pass 吃掉"
+                    ),
                 )
             )
 
     # ---- 图模式 --------------------------------------------------------
     cg = steps.get("cudagraph") or {}
-    if cg.get("available"):
+    # 引擎无 obs.graph-mode 能力时不产出图模式结论（数据来源本身就是 vLLM step 统计）
+    if cg.get("available") and _engine_has_cap(art, "obs.graph-mode"):
         modes = cg.get("dispatch_by_mode") or {}
         if modes and not any(mode != "NONE" for mode in modes):
-            graph_note = (
+            graph_note = engine_action(
                 "确认没有 `--enforce-eager`，且批次大小落在捕获桶内。"
             )
-            if vendor == "hygon":
+            if not engine_is_vllm:
+                pass  # 非 vLLM 引擎：引擎注记已替换，不再叠加 vLLM 图模式经验
+            elif vendor == "hygon":
                 graph_note += "本部署历史结论是图模式对 27B decode 收益仅 ~0.5%，优先级低于算子优化。"
             else:
                 graph_note += "图模式收益与模型/批次强相关，建议与 eager 基线做 A/B 后再决定优先级。"
@@ -1275,7 +1410,9 @@ def diagnose(art: Artifacts) -> list[Finding]:
                     "中",
                     "图捕获桶与实际批次不匹配，padding 浪费明显",
                     f"padding 比例={padding_ratio * 100:.0f}%",
-                    "调整 `--compilation-config` 的 capture sizes，让常见 batch 精确落桶",
+                    engine_action(
+                        "调整 `--compilation-config` 的 capture sizes，让常见 batch 精确落桶"
+                    ),
                 )
             )
     return findings

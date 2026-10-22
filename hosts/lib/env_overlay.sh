@@ -146,11 +146,12 @@ host_template_apply() {
     HOST_TEMPLATE_LOADED+=("${file#"$HOST_TEMPLATES_ROOT"/}")
   done
 
-  # 追加型键（EXTRA_VLLM_ARGS / EXTRA_ENV）：模板是「在已有值末尾追加」，而显式环境
-  # 优先级最高、马上会被恢复——如果调用者显式导出了这些键，模板的追加会被整体丢弃。
-  # 这是优先级约定的副作用，必须提示而不是静默（对 spec/mtp 意味着投机解码悄悄不生效）。
+  # 追加型键（EXTRA_VLLM_ARGS / EXTRA_ENV / EXTRA_ENGINE_ARGS）：模板是「在已有值末尾
+  # 追加」，而显式环境优先级最高、马上会被恢复——如果调用者显式导出了这些键，模板的
+  # 追加会被整体丢弃。这是优先级约定的副作用，必须提示而不是静默（对 spec/mtp 意味着
+  # 投机解码悄悄不生效）。
   local key
-  for key in EXTRA_VLLM_ARGS EXTRA_ENV; do
+  for key in EXTRA_VLLM_ARGS EXTRA_ENV EXTRA_ENGINE_ARGS; do
     if [[ -v "HOST_TEMPLATE_EXPLICIT_ENV[$key]" && "${!key:-}" != "${HOST_TEMPLATE_EXPLICIT_ENV[$key]}" ]]; then
       {
         printf '⚠️  显式 %s 优先于模板：模板的追加将被丢弃（模板期望值：%s）；' \
@@ -206,11 +207,12 @@ host_template_validate() {
 host_template_show() {
   local key value
   local -a keys=(
-    RUNTIME VENDOR MODEL SERVED_NAME PORT TP DTYPE GPU_MEM_UTIL
+    RUNTIME ENGINE VENDOR MODEL SERVED_NAME PORT TP DTYPE GPU_MEM_UTIL
     MAX_MODEL_LEN MAX_NUM_BATCHED_TOKENS MAX_NUM_SEQS EAGER VISIBLE_DEVICES
     DRAFT_MODEL SPEC_METHOD SPEC_TOKENS SPEC_DTYPE SPEC_KV_DTYPE SPEC_EXTRA_JSON
-    PROBE_LEVEL PROBE_PLUGIN HOST_PYTHON HOST_PRELUDE_FILES HOST_PRECHECK
-    SRC_DIR EXTRA_VLLM_ARGS EXTRA_ARGS_FILE EXTRA_ENV
+    PROBE_LEVEL PROBE_PLUGIN PROBE_ENGINE_EXTRAS HOST_PYTHON HOST_PRELUDE_FILES HOST_PRECHECK
+    SRC_DIR EXTRA_VLLM_ARGS EXTRA_ENGINE_ARGS EXTRA_ARGS_FILE EXTRA_ENV
+    HOST_ENGINE_PATTERN
   )
 
   printf '模板链：'

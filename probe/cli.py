@@ -9,6 +9,7 @@
     trace    torch profiler trace 分析（算子/kernel 级）
     plugin   汇总 stat logger 插件的 probe_steps.jsonl
     vendor   厂商适配信息：检测结果、SMI 可用性、trace 规则包
+    engine   引擎组件信息：身份、能力位（caps）、metrics 形态、入口/进程正则
     telemetry GPU 遥测采样（各厂商 SMI → 统一 JSONL）
     suite    标准化对比测试套件（固定场景矩阵 → 可跨厂商对比的 JSON）
     compare  并排对比两份 suite 结果
@@ -45,6 +46,9 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--api-key", dest="api_key", default=None, help="API key（占位即可）")
     parser.add_argument("--outdir", dest="outdir", default=None, help="产物目录")
     parser.add_argument("--timeout", dest="timeout", type=float, default=None, help="超时秒数")
+    # 引擎组件（F3 T3.5）：None → ProbeConfig.from_env 读 ENGINE 环境 → 默认 vllm
+    parser.add_argument("--engine", dest="engine", default=None,
+                        help="引擎组件 id（默认按 ENGINE 环境变量，缺省 vllm）")
 
 
 def cfg_from(args: argparse.Namespace) -> ProbeConfig:
@@ -101,16 +105,22 @@ def cmd_env(args: argparse.Namespace) -> int:
         check("指标端点", False, f"{type(exc).__name__}: {exc}")
 
     if snap is not None:
-        optional = [
-            ("vllm:kv_block_lifetime_seconds", "--kv-cache-metrics"),
-            ("vllm:estimated_flops_per_gpu_total", "--enable-mfu-metrics"),
-            ("vllm:spec_decode_num_drafts_total", "投机解码已配置"),
-            ("vllm:num_requests_waiting_by_reason", "调度等待原因分解"),
-            ("vllm:inter_token_latency_seconds", "ITL 直方图"),
-            ("vllm:prefix_cache_hits_total", "前缀缓存指标"),
-            ("vllm:prompt_tokens_cached_total", "缓存 prompt token 计数"),
-        ]
-        for name, hint in optional:
+        from .engines import profile_for_config
+
+        profile = profile_for_config(cfg)
+        # 可选指标存在性表按引擎 profile 生成（F3 T3.3）；vllm 的名字与提示语和历史
+        # 硬编码完全一致（产物逐字节一致），其它引擎用 profile 清单 + 通用提示。
+        _metric_hints = {
+            "vllm:kv_block_lifetime_seconds": "--kv-cache-metrics",
+            "vllm:estimated_flops_per_gpu_total": "--enable-mfu-metrics",
+            "vllm:spec_decode_num_drafts_total": "投机解码已配置",
+            "vllm:num_requests_waiting_by_reason": "调度等待原因分解",
+            "vllm:inter_token_latency_seconds": "ITL 直方图",
+            "vllm:prefix_cache_hits_total": "前缀缓存指标",
+            "vllm:prompt_tokens_cached_total": "缓存 prompt token 计数",
+        }
+        for name in profile.env_check_metrics:
+            hint = _metric_hints.get(name, "引擎 profile 声明的核心指标")
             present = snap.family(name) is not None
             check(f"指标 {name}", present, hint if present else f"缺失（需要 {hint}）")
         info = snap.family("vllm:cache_config_info")
@@ -174,6 +184,13 @@ def cmd_env(args: argparse.Namespace) -> int:
         payload["vendor"] = vendor_info()
     except KeyError:
         payload["vendor"] = {"id": "unknown"}  # VENDOR 环境变量非法时不阻塞自检
+    # 引擎身份（F3 T3.3）：与 vendor 并列；产物新增可选字段（F3 设计 §5 之一）
+    try:
+        from .engines import profile_for_config
+
+        payload["engine"] = profile_for_config(cfg).id
+    except Exception:  # noqa: BLE001  # 引擎解析异常不阻塞自检
+        payload["engine"] = "vllm"
     out = cfg.out_path("env_check.json")
     out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n已写入 {out}")
@@ -198,12 +215,20 @@ def cmd_metrics(args: argparse.Namespace) -> int:
     )
 
     cfg = cfg_from(args)
+    # 引擎专有指标采集（F3 T3.8）：--engine-extras 显式开启（环境键 PROBE_ENGINE_EXTRAS 亦可）
+    if getattr(args, "engine_extras", None):
+        cfg.engine_extras = True
     cfg.ensure_outdir()
 
     if args.diff:
+        from .engines import effective_metric_prefix, profile_for_config
+
         before = MetricsSnapshot.load(args.diff[0])
         after = MetricsSnapshot.load(args.diff[1])
-        diff = diff_snapshots(before, after, args.elapsed or 0.0, model=cfg.model)
+        diff = diff_snapshots(
+            before, after, args.elapsed or 0.0, model=cfg.model,
+            name_prefix=effective_metric_prefix(profile_for_config(cfg)),
+        )
         out = cfg.out_path("metrics_diff.json")
         out.write_text(json.dumps(diff, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"已写入 {out}")
@@ -227,8 +252,11 @@ def cmd_metrics(args: argparse.Namespace) -> int:
     print(f"已写入 {path}")
     print(format_stage_table(stage_table(snap)))
     if args.print:
+        from .engines import effective_metric_prefix, profile_for_config
+
+        prefix = effective_metric_prefix(profile_for_config(cfg))
         for fam in snap.families.values():
-            if fam.name.startswith("vllm:"):
+            if fam.name.startswith(prefix):
                 for series in fam.series:
                     labels = ",".join(f"{k}={v}" for k, v in sorted(series.labels.items()))
                     print(f"  {series.name}{{{labels}}} = {series.value}")
@@ -273,6 +301,17 @@ def cmd_logs(args: argparse.Namespace) -> int:
 
     cfg = cfg_from(args)
 
+    # 引擎声明（F3 T3.9）：无逐 step 日志解析器的引擎（ENGINE != vllm），
+    # 逐 step 解析不适用——打印提示后进入 --raw 透传模式（不报错、不静默）。
+    engine_id = str(getattr(cfg, "engine", "") or "vllm")
+    engine_is_vllm = engine_id == "vllm"
+    if not engine_is_vllm and not args.raw:
+        print(
+            f"ℹ️  引擎 {engine_id} 没有逐 step 日志解析器（log_probe 的正则面向 vLLM 日志格式）；"
+            "已进入 --raw 透传模式，仅回显原始行（--jsonl/--summary 在 raw 模式不生效）。",
+            file=sys.stderr,
+        )
+
     if args.stdin:
         source = sys.stdin
         live = True
@@ -282,6 +321,19 @@ def cmd_logs(args: argparse.Namespace) -> int:
     else:
         print("需要 --file 或 --stdin", file=sys.stderr)
         return 2
+
+    if not engine_is_vllm:
+        # --raw：逐行透传（stdin 或文件尾部），不做任何解析（设计 §3.5：提示后自动进入）
+        if args.stdin or args.follow:
+            stream = sys.stdin if args.stdin else follow_file(args.file, poll_s=args.poll)
+            for line in stream:
+                sys.stdout.write(line if line.endswith("\n") else line + "\n")
+        else:
+            with open(args.file, "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.readlines()
+            for line in lines[-(args.tail or args.live_tail or 40):]:
+                sys.stdout.write(line if line.endswith("\n") else line + "\n")
+        return 0
 
     events = []
     if args.stdin or args.follow:
@@ -428,6 +480,36 @@ def cmd_vendor(args: argparse.Namespace) -> int:
         cfg = cfg_from(args)
         cfg.ensure_outdir()
         out = cfg.out_path("vendor_info.json")
+        out.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"\n已写入 {out}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# 子命令：engine
+# --------------------------------------------------------------------------
+
+
+def cmd_engine(args: argparse.Namespace) -> int:
+    """展示引擎组件信息（身份、能力位、metrics 形态、入口/进程正则、备注）。"""
+    from .engines import engine_info, format_engine_info
+
+    if getattr(args, "engine", None):
+        try:
+            info = engine_info(requested=args.engine)
+        except KeyError as exc:
+            # 未知引擎给友好报错（与 shell 端的 die 文案同风格），不抛裸 traceback
+            print(str(exc.args[0] if exc.args else exc), file=sys.stderr)
+            return 2
+    else:
+        info = engine_info()
+    print(format_engine_info(info))
+    if getattr(args, "json", False):
+        print(json.dumps(info, ensure_ascii=False, indent=2))
+    if getattr(args, "write", False):
+        cfg = cfg_from(args)
+        cfg.ensure_outdir()
+        out = cfg.out_path("engine_info.json")
         out.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"\n已写入 {out}")
     return 0
@@ -671,8 +753,12 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(p_metrics)
     p_metrics.add_argument("--tag", default="metrics", help="快照文件名前缀（默认 metrics）")
     p_metrics.add_argument("--diff", nargs=2, metavar=("BEFORE", "AFTER"), help="对两个快照 JSON 做差")
+    p_metrics.add_argument("--engine-extras", dest="engine_extras", action="store_true",
+                           help="采集引擎专有指标（profile.extra_metric_families，如 strata:*）；"
+                                "默认关闭（或 PROBE_ENGINE_EXTRAS=1）")
     p_metrics.add_argument("--elapsed", type=float, default=None, help="两次快照之间的秒数")
-    p_metrics.add_argument("--print", action="store_true", help="打印全部 vllm:* 明细")
+    p_metrics.add_argument("--print", action="store_true",
+                           help="打印引擎指标前缀（profile.metric_prefix，默认 vllm:*）的全部明细")
     p_metrics.set_defaults(func=cmd_metrics)
 
     p_http = sub.add_parser("http", help="请求级探测")
@@ -695,6 +781,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_logs.add_argument("--follow", action="store_true", help="跟随文件尾部（tail -f）")
     p_logs.add_argument("--live", action="store_true", help="实时打印每个 step")
     p_logs.add_argument("--live-tail", type=int, default=40, help="--live 且非 follow 时回放的行数")
+    p_logs.add_argument("--raw", action="store_true",
+                        help="不解析，逐行透传原文（非 vLLM 引擎自动进入此模式）")
     p_logs.add_argument("--jsonl", default=None, help="事件写入 JSONL")
     p_logs.add_argument("--summary", default=None, help="汇总写入 JSON")
     p_logs.add_argument("--tail", type=int, default=None, help="只解析文件末尾 N 条事件")
@@ -733,6 +821,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_vendor.add_argument("--json", action="store_true", help="额外打印 JSON")
     p_vendor.add_argument("--write", action="store_true", help="写入 <outdir>/vendor_info.json")
     p_vendor.set_defaults(func=cmd_vendor)
+
+    p_engine = sub.add_parser("engine", help="引擎组件信息（身份/能力位/metrics 形态/入口与进程正则）")
+    add_common(p_engine)  # --engine 由 add_common 提供（显式指定引擎；默认按 ENGINE 环境变量）
+    p_engine.add_argument("--json", action="store_true", help="额外打印 JSON")
+    p_engine.add_argument("--write", action="store_true", help="写入 <outdir>/engine_info.json")
+    p_engine.set_defaults(func=cmd_engine)
 
     p_telem = sub.add_parser("telemetry", help="GPU 遥测采样（hy-smi/nvidia-smi/rocm-smi/npu-smi/xpu-smi）")
     add_common(p_telem)

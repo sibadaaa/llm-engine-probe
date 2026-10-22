@@ -48,6 +48,9 @@ while [[ $# -gt 0 ]]; do
 done
 case "$PYSPY_MODE" in dump|flame|top) ;; *) die "未知 --mode：$PYSPY_MODE（dump|flame|top）" ;; esac
 
+# 引擎组件：加载 profile（进程查找正则走 engine_process_pattern 优先级链）
+engine_meta
+
 PYSPY_BIN="${PYSPY_BIN:-py-spy}"
 # latest_run_dir 找不到目录时返回 1（不 die），据此回落去新建一个运行目录
 if ! RUN_DIR="$(latest_run_dir 2>/dev/null)"; then
@@ -116,8 +119,8 @@ if runtime_is_host; then
   fi
 
   # 注意：不要调用 host_stop_pattern——它是「按 pattern 强杀进程」的动作用函数，
-  # 这里只需要展示/匹配 pattern 本身，用变量 $HOST_VLLM_PATTERN。
-  log "查找宿主机上的 vLLM 进程（pattern：${HOST_VLLM_PATTERN:-vllm}）"
+  # 这里只需要展示/匹配 pattern 本身，用 engine_process_pattern（优先级链）。
+  log "查找宿主机上的引擎进程（pattern：$(engine_process_pattern)）"
   {
     printf '%-8s %-10s %s\n' "PID" "ELAPSED" "ARGS"
     while IFS= read -r pid; do
@@ -153,8 +156,8 @@ fi
 runtime_require
 container_running "$CONTAINER" || die "容器 $CONTAINER 未运行"
 
-log "查找容器内的 vLLM 进程"
-docker exec "$CONTAINER" bash -lc "ps -eo pid,etime,args | grep -E 'vllm|EngineCore|APIServer' | grep -v grep" > "$PROC_FILE" || true
+log "查找容器内的引擎进程"
+docker exec "$CONTAINER" bash -lc "ps -eo pid,etime,args | grep -E '$(engine_process_pattern)' | grep -v grep" > "$PROC_FILE" || true
 cut -c1-160 "$PROC_FILE"
 
 if [[ -n "$TARGET_PID" ]]; then

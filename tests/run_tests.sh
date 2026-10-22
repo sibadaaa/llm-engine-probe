@@ -28,7 +28,7 @@ if python3 -m unittest discover -s tests -v; then check 0 "unittest 全部通过
 # ---------------------------------------------------------------------------
 step "2/5 脚本语法检查（bash -n）"
 SYNTAX_OK=0
-for script in scripts/*.sh scripts/lib/*.sh vendors/*.sh tests/run_tests.sh tests/host_mode_selftest.sh tests/host_templates_selftest.sh; do
+for script in scripts/*.sh scripts/lib/*.sh engines/*.sh vendors/*.sh tests/run_tests.sh tests/host_mode_selftest.sh tests/host_templates_selftest.sh; do
   if bash -n "$script" 2>/tmp/bashn.err; then
     printf '  ok   %s\n' "$script"
   else
@@ -168,6 +168,114 @@ check $? "probe_all.sh 一键编排"
 [[ -f "$RUN/REPORT.md" ]] && check 0 "REPORT.md 已生成" || check 1 "缺少 REPORT.md"
 grep -q "自动归因与优化建议" "$RUN/REPORT.md" && check 0 "报告包含自动归因章节" || check 1 "报告缺自动归因"
 grep -q "stat logger 插件" "$RUN/REPORT.md" && check 0 "报告包含插件结构化数据一节" || check 1 "报告缺插件一节"
+
+# ---------------------------------------------------------------------------
+# 3b. strata flavor 端到端（F3 T3.7：无硬件的引擎能力协商回归）
+# ---------------------------------------------------------------------------
+step "3b/5 strata flavor 端到端（引擎协商）"
+SPORT="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
+SBASE="http://127.0.0.1:$SPORT"
+SOUT="$RUN/strata"
+mkdir -p "$SOUT"
+MOCK_TRACE_DIR="$RUN/traces" python3 tests/mock_vllm_server.py --port "$SPORT" --flavor strata \
+  > "$RUN/mock-strata.log" 2>&1 &
+MOCK_SPID=$!
+cleanup() { kill "$MOCK_PID" "$MOCK_SPID" 2>/dev/null || true; }
+sready=1
+for _ in $(seq 1 40); do
+  if curl -sf -m 2 "$SBASE/health" >/dev/null 2>&1; then sready=0; break; fi
+  sleep 0.25
+done
+check $sready "strata mock 服务已就绪（:$SPORT）"
+
+# env：engine 字段落产物 + 可选指标表为 strata 集（无 cache_config_info 专列）
+ENGINE=strata python3 -m probe env --base-url "$SBASE" --outdir "$SOUT" --no-request \
+  > "$SOUT/env.out" 2>&1
+check $? "probe env（ENGINE=strata）"
+python3 - "$SOUT/env_check.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["engine"] == "strata", f"engine 字段错误: {d.get('engine')}"
+names = [c["name"] for c in d["checks"] if c["name"].startswith("指标 ")]
+assert any("time_to_first_token_seconds" in n for n in names), f"strata 指标表缺 TTFT: {names}"
+assert not any("kv_block_lifetime" in n for n in names), "strata 不应有 kv_block 指标行"
+assert not any("cache_config_info" in n for n in names), "strata 不应有 cache_config_info 指标行"
+print("  env_check engine=strata；指标表为 strata 集")
+PY
+check $? "env_check.json 引擎字段与 strata 指标表"
+
+# http：reasoning_content 前缀块被计数（TTFT 出数）、逐请求 metrics 显式降级、engine 落产物
+ENGINE=strata python3 -m probe http --base-url "$SBASE" --outdir "$SOUT" \
+  --prompt-tokens 128 --max-tokens 16 --concurrency 2 --repeat 2 > "$SOUT/http.out" 2>&1
+check $? "probe http（ENGINE=strata）"
+python3 - "$SOUT/http_summary.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["config"]["engine"] == "strata", "http_summary 配置缺 engine=strata"
+assert d["ttft_ms"]["p50"] is not None, "TTFT 缺失（reasoning_content 应被 delta_content_keys 计数）"
+assert d["server_side"]["available"] is False, "strata 不应有逐请求服务端指标"
+assert "obs.per-request-metrics" in d["server_side"]["hint"], "降级 hint 应说明能力位"
+assert d["spec_decode"]["available"] is False
+print("  http_summary：TTFT 出数、server_side/spec 降级注记、engine=strata")
+PY
+check $? "http_summary.json 引擎协商"
+
+# metrics：?format=prometheus 后缀抓取命中 + 阶段表缺项行（5 个生命周期直方图缺失）
+ENGINE=strata python3 -m probe metrics --base-url "$SBASE" --outdir "$SOUT" --tag metrics_before \
+  > "$SOUT/m1.out" 2>&1
+check $? "strata metrics 快照（suffix 抓取）"
+# metrics_after 带 --engine-extras（F3 T3.8）：engine_extra 段落产物，报告可读
+ENGINE=strata python3 -m probe metrics --base-url "$SBASE" --outdir "$SOUT" --tag metrics_after \
+  --engine-extras > "$SOUT/m2.out" 2>&1
+check $? "strata metrics 快照 2（--engine-extras）"
+python3 - "$SOUT/metrics_after.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+fams = ((d.get("meta") or {}).get("engine_extra") or {}).get("families") or {}
+assert "strata:last_hit_rate" in fams, f"engine_extra 缺 strata:last_hit_rate: {list(fams)}"
+assert "strata:live_tok_s" in fams
+print("  engine_extra 段已采集 strata:* 指标")
+PY
+check $? "engine_extra 段落产物（--engine-extras）"
+ENGINE=strata python3 -m probe metrics --outdir "$SOUT" --diff "$SOUT/metrics_before.json" \
+  "$SOUT/metrics_after.json" --elapsed 5 > "$SOUT/diff.out" 2>&1
+check $? "strata 指标差分"
+grep -q "该指标未导出" "$SOUT/m1.out" && check 0 "阶段表缺项行 available=False（queue/prefill/decode 等）" \
+  || check 1 "阶段表缺项行缺失"
+python3 - "$RUN/metrics_before.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert "engine_extra" not in (d.get("meta") or {}), "vLLM 链路不应出现 engine_extra 段"
+print("  vLLM 快照无 engine_extra（默认关闭 schema 不变）")
+PY
+check $? "vLLM 快照 schema 不变（无 engine_extra）"
+
+# suite + report：engine 上下文、报告引擎行与能力降级注记、diagnose 引擎化
+ENGINE=strata python3 -m probe suite --base-url "$SBASE" --outdir "$SOUT" --scenarios s02,s06 \
+  > "$SOUT/suite.out" 2>&1
+check $? "probe suite（ENGINE=strata）"
+python3 - "$SOUT/suite_results.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["kind"] == "vllm-probe-suite", "kind 契约不能改"
+assert d["engine"]["engine"] == "strata", f"套件上下文缺 engine: {d['engine'].get('engine')}"
+print("  suite_results：kind 不变、上下文带 engine=strata")
+PY
+check $? "suite_results.json 引擎上下文"
+ENGINE=strata python3 -m probe report --outdir "$SOUT" > "$SOUT/report.out" 2>&1
+check $? "probe report（ENGINE=strata）"
+grep -q "引擎：Strata" "$SOUT/REPORT.md" && check 0 "REPORT.md 含引擎行" || check 1 "REPORT.md 缺引擎行"
+grep -q "不支持逐 step 日志/插件观测" "$SOUT/REPORT.md" \
+  && check 0 "REPORT.md 含逐 step 降级注记" || check 1 "REPORT.md 缺逐 step 注记"
+grep -q "kernel 归因不适用" "$SOUT/REPORT.md" \
+  && check 0 "REPORT.md 含 kernel 降级注记" || check 1 "REPORT.md 缺 kernel 注记"
+grep -q "专家缓存命中率（引擎侧）" "$SOUT/REPORT.md" \
+  && check 0 "REPORT.md §4 含引擎侧命中率（engine_extra）" || check 1 "REPORT.md 缺引擎侧命中率行"
+if grep -qE '\-\-max-num-seqs|\-\-max-num-batched-tokens|\-\-enable-prefix-caching|\-\-enforce-eager|\-\-speculative-config' "$SOUT/REPORT.md"; then
+  check 1 "diagnose 不应含 vLLM flag 建议（引擎化失败）"
+else
+  check 0 "diagnose 无 vLLM flag 建议（已替换为引擎注记）"
+fi
 
 # ---------------------------------------------------------------------------
 step "4/5 物理机（host）模式自测"

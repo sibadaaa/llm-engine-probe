@@ -134,10 +134,14 @@ llm-engine-probe/
 │   ├── README.md                 ← 新增一家厂商的完整指南
 │   ├── _template.sh              ← 适配模板（含每个变量说明）
 │   └── <vendor>.sh               ← 设备直通/环境注入/SMI 命令/探测元数据
+├── engines/                      ← 引擎组件注册表（Shell 端）：vllm（默认）/strata/...
+│   ├── _template.sh              ← 引擎 profile 骨架（含每个字段说明）
+│   └── <engine>.sh               ← serve 入口/进程正则/能力位（caps）；契约见 docs/design/
 ├── hosts/                        ← 物理机启动模板（厂商/场景/量化/投机/部署；模板不侵入核心）
 │   ├── vllm-host.sh              ← 模板入口：list/show/check/dry-run/up/down/status/probe/...
 │   ├── README.md                 ← 模板索引、叠加规则、新增模板约定
 │   ├── vendor/ scenario/ quant/ spec/  ← 各类 .env 模板
+│   ├── engine/                   ← 引擎模板（ENGINE 切换 + 引擎语义的模型/并行参数）
 │   └── deploy/                   ← systemd、外部实例只读探测、PD/多机骨架
 ├── docker/
 │   ├── Dockerfile                ← 探针就绪镜像（叠加在任意厂商的 vLLM 基础镜像上）
@@ -147,6 +151,7 @@ llm-engine-probe/
 ├── configs/                      ← Prometheus 抓取配置、Grafana 看板、OTel 采集器
 ├── probe/                        ← Python 工具包（纯标准库，容器内也能跑）
 │   ├── vendors.py                ← 厂商注册表（分析侧：trace 规则包/报告文案/诊断阈值）
+│   ├── engines.py                ← 引擎组件注册表（能力位 caps/指标形态/入口与进程正则）
 │   ├── telemetry.py              ← GPU 遥测抽象：5 家 SMI → 统一 gpu_telem.jsonl
 │   ├── suite.py                  ← 标准化对比套件（固定场景矩阵 + 跨厂商并排对比）
 │   ├── metrics_probe.py          ← /metrics 解析、直方图分位、阶段表
@@ -353,6 +358,7 @@ bash scripts/host_check.sh [--json] [--quick] [--start]   # 物理机环境预�
 ```bash
 python3 -m probe env       --port 8100                 # 能力自检
 python3 -m probe vendor                                # 厂商检测/能力矩阵
+python3 -m probe engine                                # 引擎组件信息（身份/能力位/metrics 形态）
 python3 -m probe metrics   --port 8100 --print         # 指标快照 + 阶段表
 python3 -m probe http      --port 8100 --concurrency 8 # 请求级
 python3 -m probe logs      --file runs/x/serve.log --live
@@ -363,6 +369,11 @@ python3 -m probe suite     --port 8100 --list              # 标准化套件矩�
 python3 -m probe compare   --a runs/a/suite_results.json --b runs/b/suite_results.json
 python3 -m probe report    --outdir runs/x
 ```
+
+> 多引擎支持（`ENGINE=vllm|strata|...`，引擎组件即插即用接口）：设计契约与接入三步见
+> [`docs/design/`](docs/design/README.md)（F1 组件接口 / F2 Strata 适配 / F3 观测面兼容）；
+> 探针默认行为只假设"OpenAI 兼容 API + /metrics"，差异全部走引擎能力位（caps）协商。
+> Strata 的完整接入说明见 [`docs/strata-接入指南.md`](docs/strata-接入指南.md)。
 
 ---
 
@@ -405,6 +416,12 @@ make compare A=runs/dcu/suite_results.json B=runs/nvidia/suite_results.json OUT=
 顶部还记录厂商/硬件（一次 SMI 采样）/引擎配置（`vllm:cache_config_info` 标签）。
 
 任何场景失败只记录错误、不中断整套（半可用的卡也能拿到能对比的部分）。
+
+> 多引擎（`ENGINE`）说明：套件对非 vLLM 引擎按能力位协商——缺逐请求指标的引擎其
+> `server_side/spec_decode` 为 `available=False`；`kind` 字段（`vllm-probe-suite`）保持不变，
+> compare 的缺项 null 兼容跨引擎对比。字段差异见
+> [`docs/design/observability-compat/设计.md`](docs/design/observability-compat/设计.md) §3
+> 与 [`docs/strata-接入指南.md`](docs/strata-接入指南.md)。
 
 ---
 
@@ -562,6 +579,12 @@ amd=amd-smi/rocm-smi、ascend=npu-smi、intel=xpu-smi），解析在
 ```
 
 **第 8 节是重点**：每条结论都带触发它的证据数字和可执行建议，规则写在 `probe/report.py` 的 `diagnose()` 里，阈值集中在 `DEFAULT_THRESHOLDS`、可按厂商在 `probe/vendors.py::diagnose_overrides` 覆盖。举几个真实会触发的例子：
+
+> 多引擎（`ENGINE`）说明：报告的概览含「引擎」行；引擎不具备某观测能力时（无逐 step 日志 /
+> torch profiler / 逐请求指标），对应小节给出**显式降级注记**而非空白；非 vLLM 引擎的
+> diagnose 建议不再给 vLLM CLI flag（替换为引擎注记）。字段差异详见
+> [`docs/design/observability-compat/设计.md`](docs/design/observability-compat/设计.md) §3
+> 与 [`docs/strata-接入指南.md`](docs/strata-接入指南.md)。
 
 | 触发条件 | 结论 | 建议方向 |
 |---|---|---|

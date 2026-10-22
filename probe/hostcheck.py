@@ -70,6 +70,7 @@ CHECK_DEFS: tuple[tuple[str, str], ...] = (
     ("os", "操作系统"),
     ("host_python", "宿主 Python 解释器"),
     ("python_version", "Python 版本"),
+    ("engine", "引擎组件预检"),
     ("vllm", "vLLM 可导入"),
     ("torch", "PyTorch / 加速器"),
     ("gpu_smi", "GPU 遥测（SMI）"),
@@ -86,7 +87,7 @@ CHECK_NAMES = dict(CHECK_DEFS)
 CHECK_IDS = [cid for cid, _ in CHECK_DEFS]
 
 # --start 只跑 fail 级核心项（其余全部跳过）；--quick 跳过耗时的 import/SMI 采样
-CORE_CHECK_IDS = ("os", "host_python", "python_version", "model_path", "port", "curl")
+CORE_CHECK_IDS = ("os", "host_python", "python_version", "engine", "model_path", "port", "curl")
 
 TOKENIZER_HINTS = (
     "tokenizer_config.json",
@@ -339,6 +340,7 @@ class _Tracker:
             "python_version": None,
             "torch": None,
             "vllm": None,
+            "engine": None,
             "device_count": None,
             "cuda_available": None,
             "hip": None,
@@ -402,6 +404,8 @@ class _Context:
     py_error: str | None
     vendor_profile: Any = None
     vendor_error: str | None = None
+    engine_profile: Any = None
+    engine_error: str | None = None
     platform_info: dict[str, str] = field(default_factory=dict)
 
 
@@ -480,6 +484,76 @@ def _check_python_version(ctx: _Context, tr: _Tracker) -> None:
             hint=f"vLLM 需要 Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+；用 HOST_PYTHON 指向新版解释器（如 venv）",
             severity="warn",
         )
+
+
+def _check_engine(ctx: _Context, tr: _Tracker) -> None:
+    """引擎组件预检（docs/design/component-interface/设计.md §8）。
+
+    * ENGINE=vllm：直接跳过（import 探测由 vllm 检查项覆盖，行为零变化）；
+    * 引擎 profile 声明了 ENGINE_VERSION_CMD：host 侧执行取首行版本（10s 超时），
+      命令不存在/失败按 profile.check_severity 处置（warn 不阻塞 / fail 阻塞）；
+    * 无版本命令：尝试 GET {health_path} HTTP 兜底（纯 urllib），再不行 skip。
+    """
+    profile = ctx.engine_profile
+    if profile is None:
+        tr.skip("engine", f"引擎 profile 不可用（{ctx.engine_error or '未知原因'}）")
+        return
+    if profile.id == "vllm":
+        tr.skip("engine", "ENGINE=vllm，引擎检查由 vllm 检查项覆盖")
+        return
+    caps_desc = " ".join(sorted(profile.caps)) or "（无）"
+    if profile.version_cmd:
+        version, err = _run_version_cmd(profile.version_cmd)
+        if version:
+            tr.versions["engine"] = version
+            tr.add("engine", True, f"ENGINE={profile.id}（{profile.label}）版本 {version}；能力位：{caps_desc}")
+            return
+        tr.add(
+            "engine",
+            False,
+            f"ENGINE={profile.id} 版本探测失败（{profile.version_cmd}）：{err or '无输出'}",
+            hint=(
+                "常见原因：引擎未安装或不在 PATH（桌面 App 安装常见，属预期形态）；"
+                "外部探测模式确认可用即可，必要时调低引擎 profile 的 ENGINE_CHECK_SEVERITY"
+            ),
+            severity=profile.check_severity,
+        )
+        return
+    ok, detail = _probe_engine_http(profile)
+    if ok:
+        tr.add("engine", True, f"ENGINE={profile.id}（{profile.label}）{detail}；能力位：{caps_desc}")
+    else:
+        tr.skip("engine", f"ENGINE={profile.id} 无 ENGINE_VERSION_CMD 且 HTTP 兜底未命中：{detail}")
+
+
+def _run_version_cmd(version_cmd: str) -> tuple[str, str]:
+    """执行引擎版本命令，返回 (首行版本, 失败原因)；命令不存在/超时按失败处理。"""
+    try:
+        cmd = shlex.split(version_cmd)
+    except ValueError as exc:
+        return "", f"{type(exc).__name__}: {exc}"
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return "", f"{type(exc).__name__}: {exc}"
+    out = (proc.stdout or "").strip()
+    if proc.returncode == 0 and out:
+        return out.splitlines()[0].strip(), ""
+    err_lines = (proc.stderr or "").strip().splitlines()
+    return "", (err_lines[-1] if err_lines else f"exit={proc.returncode}")
+
+
+def _probe_engine_http(profile: Any) -> tuple[bool, str]:
+    """HTTP 兜底：GET {base_url}{health_path}（5s 超时；只读探活，无副作用）。"""
+    import urllib.request
+
+    base = os.environ.get("VLLM_BASE_URL") or f"http://127.0.0.1:{_env_int('PORT', DEFAULT_PORT)}"
+    url = base.rstrip("/") + profile.health_path
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:  # noqa: S310（本地探测）
+            return True, f"HTTP 可达（GET {url} → {resp.status}）"
+    except Exception as exc:  # noqa: BLE001（兜底探测，任何失败都只降级）
+        return False, f"GET {url} 失败：{type(exc).__name__}: {exc}"
 
 
 def _check_vllm(ctx: _Context, tr: _Tracker) -> None:
@@ -863,6 +937,7 @@ _CHECKS: tuple[tuple[str, Callable[[_Context, _Tracker], None]], ...] = (
     ("os", _check_os),
     ("host_python", _check_host_python),
     ("python_version", _check_python_version),
+    ("engine", _check_engine),
     ("vllm", _check_vllm),
     ("torch", _check_torch),
     ("gpu_smi", _check_gpu_smi),
@@ -891,6 +966,15 @@ def _resolve_vendor() -> tuple[Any, str | None]:
         return None, f"{type(exc).__name__}: {exc}"
 
 
+def _resolve_engine_profile(engine_id: str) -> tuple[Any, str | None]:
+    from .engines import get_engine
+
+    try:
+        return get_engine(engine_id), None
+    except Exception as exc:  # 非法 ENGINE 等：不影响其它检查（engine 项降级为 skip）
+        return None, f"{type(exc).__name__}: {exc}"
+
+
 def collect_hostcheck(
     *,
     host_python: str | None = None,
@@ -901,6 +985,7 @@ def collect_hostcheck(
     start: bool = False,
     skip_vllm_import: bool = False,
     skip_gpu: bool = False,
+    engine: str | None = None,
 ) -> dict[str, Any]:
     """执行全部检查并返回 host_check payload（不写文件、不打印）。"""
     requested_py = (
@@ -935,6 +1020,9 @@ def collect_hostcheck(
     profile, vendor_error = _resolve_vendor()
     if profile is not None:
         tracker.versions["vendor"] = profile.id
+    # 引擎组件（T1.10）：显式参数 > ENGINE 环境变量 > vllm；解析失败不影响其它检查项
+    engine_id = (str(engine) if engine is not None else os.environ.get("ENGINE") or "vllm").strip() or "vllm"
+    engine_profile, engine_error = _resolve_engine_profile(engine_id)
 
     py_info: dict[str, Any] | None = None
     py_error: str | None = None
@@ -987,6 +1075,8 @@ def collect_hostcheck(
         py_error=py_error,
         vendor_profile=profile,
         vendor_error=vendor_error,
+        engine_profile=engine_profile,
+        engine_error=engine_error,
         platform_info={
             "system": platform.system(),
             "release": platform.release(),
@@ -1017,6 +1107,8 @@ def collect_hostcheck(
         "runtime": "host",
         "host_python": ctx.host_python_resolved,
         "vendor": profile.id if profile is not None else (os.environ.get("VENDOR") or "unknown"),
+        "engine": engine_profile.id if engine_profile is not None else engine_id,
+        "engine_caps": sorted(engine_profile.caps) if engine_profile is not None else [],
         "ok": summary["fail"] == 0,
         "summary": summary,
         "versions": tracker.versions,

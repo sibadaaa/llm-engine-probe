@@ -29,6 +29,8 @@ TOP_KEYS = {
     "runtime",
     "host_python",
     "vendor",
+    "engine",
+    "engine_caps",
     "ok",
     "summary",
     "versions",
@@ -39,6 +41,7 @@ CHECK_IDS = [
     "os",
     "host_python",
     "python_version",
+    "engine",
     "vllm",
     "torch",
     "gpu_smi",
@@ -508,6 +511,95 @@ class PreludeEnvTests(HostCheckTestBase):
         # 环境没生效 → 假解释器拒绝输出 JSON → import 失败是 fail 级
         self.assertFalse(checks["vllm"]["ok"])
         self.assertEqual(proc.returncode, 1)
+
+
+class EngineCheckTests(HostCheckTestBase):
+    """T1.10：引擎组件预检（_check_engine）的 skip / warn / fail 三条路径。
+
+    用临时注册的 fake engine profile 驱动（不依赖真实引擎安装）。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        from probe.engines import EngineProfile, ENGINE_REGISTRY
+
+        self._ENGINE_REGISTRY = ENGINE_REGISTRY
+        self._EngineProfile = EngineProfile
+
+    def _register_fake_engine(self, **overrides) -> str:
+        """临时注册 fake 引擎，返回引擎 id（测试结束自动清理）。"""
+        eid = "fake-test-engine"
+        defaults = dict(
+            id=eid,
+            label="Fake 测试引擎",
+            caps=frozenset({"api.openai-chat", "api.health", "runtime.host"}),
+            check_severity="fail",
+        )
+        defaults.update(overrides)
+        self._ENGINE_REGISTRY[eid] = self._EngineProfile(**defaults)
+        self.addCleanup(self._ENGINE_REGISTRY.pop, eid, None)
+        return eid
+
+    def test_default_vllm_skips_engine_check(self) -> None:
+        fake = self.fake_python()
+        proc, payload, _ = self.run_json(*self.base_args(fake))
+        checks = self.checks_by_id(payload)
+        self.assertIn("engine", checks)
+        self.assertTrue(checks["engine"]["ok"])
+        self.assertIn("已跳过", checks["engine"]["detail"])
+        self.assertEqual(payload["engine"], "vllm")
+        self.assertIn("api.openai-chat", payload["engine_caps"])
+
+    def test_version_cmd_success_is_ok(self) -> None:
+        eid = self._register_fake_engine(version_cmd="echo 9.9.9-fake")
+        payload = self._collect(engine=eid)
+        checks = self.checks_by_id(payload)
+        self.assertTrue(checks["engine"]["ok"], checks["engine"])
+        self.assertEqual(checks["engine"]["level"], "info")
+        self.assertEqual(payload["versions"]["engine"], "9.9.9-fake")
+        self.assertEqual(payload["engine"], eid)
+
+    def test_version_cmd_missing_binary_is_fail_and_exit_1(self) -> None:
+        eid = self._register_fake_engine(version_cmd="definitely-not-a-real-cmd-xyz")
+        payload = self._collect(engine=eid)
+        checks = self.checks_by_id(payload)
+        self.assertFalse(checks["engine"]["ok"])
+        self.assertEqual(checks["engine"]["level"], "fail")
+        self.assertFalse(payload["ok"])
+
+    def test_version_cmd_missing_binary_warn_severity_passes(self) -> None:
+        eid = self._register_fake_engine(
+            version_cmd="definitely-not-a-real-cmd-xyz", check_severity="warn"
+        )
+        payload = self._collect(engine=eid)
+        checks = self.checks_by_id(payload)
+        self.assertFalse(checks["engine"]["ok"])
+        self.assertEqual(checks["engine"]["level"], "warn")
+        # warn 不影响退出码（ok = fail == 0）
+        self.assertEqual(payload["summary"]["fail"], 0)
+        self.assertTrue(payload["ok"])
+
+    # -- in-process helpers ---------------------------------------------
+    def _collect(self, engine: str) -> dict:
+        """进程内调 collect_hostcheck（fake profile 只在本进程注册表里可见）。"""
+        from probe.hostcheck import collect_hostcheck
+
+        return collect_hostcheck(
+            host_python=str(self.fake_python()),
+            model=str(self.model),
+            port=self.port,
+            skip_gpu=True,
+            engine=engine,
+        )
+
+    def test_unknown_engine_degrades_to_skip_not_crash(self) -> None:
+        fake = self.fake_python()
+        proc, payload, _ = self.run_json(*self.base_args(fake), env_extra={"ENGINE": "no-such-engine"})
+        checks = self.checks_by_id(payload)
+        self.assertTrue(checks["engine"]["ok"])
+        self.assertIn("已跳过", checks["engine"]["detail"])
+        self.assertEqual(payload["engine"], "no-such-engine")
+        self.assertEqual(payload["engine_caps"], [])
 
 
 if __name__ == "__main__":  # pragma: no cover

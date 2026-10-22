@@ -81,6 +81,10 @@ class ProbeConfig:
 
     # ---- 容器/引擎定位（shell 脚本用，Python 侧只做记录）----
     container: str = "vllm-probe"
+    # 引擎组件 id（engines/<id>.sh ↔ probe/engines.py；探针按能力位协商行为）
+    engine: str = "vllm"
+    # 采集引擎专有指标（F3 T3.8，默认关闭；PROBE_ENGINE_EXTRAS=1 或 --engine-extras 开启）
+    engine_extras: bool = False
     port: int = 8100
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -102,6 +106,8 @@ class ProbeConfig:
             shared_prefix_tokens=env_int("PROBE_SHARED_PREFIX_TOKENS", 0),
             temperature=env_float("PROBE_TEMPERATURE", 0.0),
             container=env_str("CONTAINER", "vllm-probe"),
+            engine=env_str("ENGINE", "vllm"),
+            engine_extras=env_str("PROBE_ENGINE_EXTRAS", "0") in ("1", "true", "True"),
             port=env_int("PORT", 8100),
         )
 
@@ -168,5 +174,6 @@ class ProbeConfig:
             f"base_url={self.base_url} model={self.model} "
             f"prompt_tokens={self.prompt_tokens} max_tokens={self.max_tokens} "
             f"concurrency={self.concurrency} repeat={self.repeat} "
-            f"endpoint={self.endpoint} stream={self.stream} outdir={self.outdir}"
+            f"endpoint={self.endpoint} stream={self.stream} engine={self.engine} "
+            f"outdir={self.outdir}"
         )

@@ -40,6 +40,9 @@ RUNTIME="$(runtime_normalize "${RUNTIME:-docker}")"
 export RUNTIME
 runtime_require
 
+# 引擎组件：加载 profile（ENGINE_PROCESS_PATTERN 供进程正则优先级链使用；未知 ENGINE die）
+engine_meta
+
 # 等待显存释放（docker --kill-exec 与 host 停止共用；无 SMI 的机器直接跳过）
 # PROBE_SKIP_VRAM_WAIT=1 / --no-vram-wait 时跳过（测试/CI/同机已有其它显存占用）。
 wait_vram_release() {
@@ -124,7 +127,11 @@ fi
 # ---------------------------------------------------------------------------
 if (( KILL_EXEC )); then
   container_running "$EXEC_CONTAINER" || die "容器 $EXEC_CONTAINER 未运行"
-  pattern='vllm.entrypoints.cli.main|vllm\.v1\.engine|s19_|serve_'
+  # 进程正则 = 引擎优先级链结果（HOST_ENGINE_PATTERN > ENGINE_PROCESS_PATTERN > HOST_VLLM_PATTERN）
+  # 再追加历史 docker --kill-exec 专属段（s19_|serve_，本站点容器内进程名）：
+  # 旧版 kill-exec 的 pattern 就含这一段，host 侧 pgrep 不需要它，这里显式保留防止漏杀
+  # （--kill-exec 本就是破坏性兜底操作，宁可多匹配）。
+  pattern="$(engine_process_pattern)|s19_|serve_"
   log "在容器 $EXEC_CONTAINER 内终止 vLLM 进程（pattern: $pattern）"
   docker exec "$EXEC_CONTAINER" bash -lc "
     for p in \$(ps -eo pid,args | grep -E '$pattern' | grep -v grep | awk '{print \$1}'); do

@@ -10,9 +10,16 @@
 * ``POST /start_profile`` / ``POST /stop_profile``
                                 在 ``MOCK_TRACE_DIR`` 里生成一个假的 Chrome trace
 
+``--flavor strata``（F3 T3.7）模拟 Strata 引擎的观测面差异（事实依据
+``docs/design/strata-engine/事实核对.md``）：/metrics 默认回 JSON（要
+``?format=prometheus`` 或 ``Accept: text/plain`` 才回文本）、vLLM 名子集指标、
+chat delta 用 ``reasoning_content`` 前缀块且无 ``chunk.metrics``、无
+``/v1/completions``。
+
 用法::
 
     python3 tests/mock_vllm_server.py --port 18000
+    python3 tests/mock_vllm_server.py --port 18001 --flavor strata
 """
 
 from __future__ import annotations
@@ -27,6 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 MODEL = os.environ.get("MOCK_MODEL", "qwen3.8-27b")
+FLAVOR = "vllm"  # vllm | strata（--flavor 设置）
 STATE = {"requests": 0, "prompt_tokens": 0, "generation_tokens": 0, "cached_tokens": 0,
          "drafts": 0, "draft_tokens": 0, "accepted_tokens": 0, "profiling": False}
 LOCK = threading.Lock()
@@ -144,7 +152,62 @@ def metrics_text() -> str:
         lines.append(f"{name}{{engine=\"0\",model_name=\"{MODEL}\"}} {value}")
     hist("vllm:kv_block_lifetime_seconds", "Histogram of KV cache block lifetime.",
          [0.1, 1.0, 10.0, 60.0, 600.0], [12.0, 30.0, 45.0])
-    return "\n".join(lines) + "\n"
+    text = "\n".join(lines) + "\n"
+    if FLAVOR == "strata":
+        return _strata_metrics_view(text)
+    return text
+
+
+# strata flavor 保留的 vLLM 名子集（docs/design/observability-compat/设计.md §4）：
+# running/waiting、KV 使用率、token/request 计数器、prefix cache、spec 计数器、
+# TTFT/ITL/e2e 直方图；**无** 5 个生命周期直方图、cache_config_info、kv_block_*、
+# preemptions、waiting_by_reason、MFU、per-position 投机分布。
+_STRATA_KEEP: frozenset[str] = frozenset({
+    "vllm:num_requests_running",
+    "vllm:num_requests_waiting",
+    "vllm:kv_cache_usage_perc",
+    "vllm:prompt_tokens_total",
+    "vllm:generation_tokens_total",
+    "vllm:prompt_tokens_cached_total",
+    "vllm:prefix_cache_queries_total",
+    "vllm:prefix_cache_hits_total",
+    "vllm:request_success_total",
+    "vllm:spec_decode_num_drafts_total",
+    "vllm:spec_decode_num_draft_tokens_total",
+    "vllm:spec_decode_num_accepted_tokens_total",
+    "vllm:e2e_request_latency_seconds",
+    "vllm:time_to_first_token_seconds",
+    "vllm:inter_token_latency_seconds",
+})
+
+
+def _strata_metrics_view(text: str) -> str:
+    """把 vLLM 全集指标文本裁成 strata 子集，并追加 strata: 专有样本。"""
+    out: list[str] = []
+    for line in text.splitlines():
+        name = ""
+        if line.startswith("# HELP ") or line.startswith("# TYPE "):
+            name = line.split()[2] if len(line.split()) > 2 else ""
+        elif line.strip() and not line.startswith("#"):
+            name = line.split("{")[0].split()[0]
+            for suffix in ("_bucket", "_count", "_sum"):
+                if name.endswith(suffix):
+                    name = name[: -len(suffix)]
+        if name and name in _STRATA_KEEP:
+            out.append(line)
+    # strata: 专有指标样本（真实引擎缺失值不出样本；这里给恒定样本验证采集路径）
+    out += [
+        "# HELP strata:live_tok_s Current decode tokens per second.",
+        "# TYPE strata:live_tok_s gauge",
+        f'strata:live_tok_s{{model_name="{MODEL}"}} 27.5',
+        "# HELP strata:last_hit_rate Expert cache hit rate of the last request window.",
+        "# TYPE strata:last_hit_rate gauge",
+        f'strata:last_hit_rate{{model_name="{MODEL}"}} 0.83',
+        "# HELP strata:gpu_util GPU utilization reported by the engine.",
+        "# TYPE strata:gpu_util gauge",
+        'strata:gpu_util{gpu="0"} 0.91',
+    ]
+    return "\n".join(out) + "\n"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -182,10 +245,24 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"OK")
         elif path == "/v1/models":
-            self._json({"object": "list", "data": [{"id": MODEL, "object": "model"}]})
+            model_id = "strata" if FLAVOR == "strata" else MODEL
+            self._json({"object": "list", "data": [{"id": model_id, "object": "model"}]})
         elif path == "/version":
             self._json({"version": "0.18.1-mock"})
         elif path == "/metrics":
+            if FLAVOR == "strata":
+                # 关键坑（事实核对 §5）：/metrics 默认返回 JSON，必须显式要 Prometheus 文本
+                query = self.path.split("?", 1)[1] if "?" in self.path else ""
+                wants_text = "format=prometheus" in query or "text/plain" in (
+                    self.headers.get("Accept") or ""
+                )
+                if not wants_text:
+                    self._json({
+                        "error": "use format=prometheus",
+                        "detail": "该引擎 /metrics 默认返回 JSON；带 ?format=prometheus "
+                                  "或 Accept: text/plain 获取 Prometheus 文本",
+                    })
+                    return
             body = metrics_text().encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; version=0.0.4")
@@ -206,6 +283,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Length", "0")
             self.end_headers()
+            return
+        if path == "/v1/completions" and FLAVOR == "strata":
+            # Strata 未提供 /v1/completions（事实核对 §5）：端点缺失路径
+            self._json({"error": "not found",
+                        "detail": "该引擎未提供 /v1/completions"}, 404)
             return
         if path in ("/v1/chat/completions", "/v1/completions"):
             self.handle_inference(path)
@@ -275,8 +357,9 @@ class Handler(BaseHTTPRequestHandler):
                     }
                 ],
                 "usage": usage,
-                "metrics": per_request_metrics,
             }
+            if FLAVOR != "strata":
+                payload["metrics"] = per_request_metrics
             self._json(payload)
             return
 
@@ -296,7 +379,11 @@ class Handler(BaseHTTPRequestHandler):
             for i in range(max_tokens):
                 if path.endswith("chat/completions"):
                     delta = {"role": "assistant"} if i == 0 else {}
-                    delta["content"] = f"tok{i} "
+                    if FLAVOR == "strata" and i < 2:
+                        # strata：思考增量走 reasoning_content（事实核对 §7）
+                        delta["reasoning_content"] = f"think{i} "
+                    else:
+                        delta["content"] = f"tok{i} "
                     choice = {"index": 0, "delta": delta, "finish_reason": None}
                 else:
                     choice = {"index": 0, "text": f"tok{i} ", "finish_reason": None}
@@ -310,8 +397,12 @@ class Handler(BaseHTTPRequestHandler):
             )
             send_event({"id": req_id, "object": "chat.completion.chunk", "model": MODEL,
                         "choices": [final_choice]})
-            send_event({"id": req_id, "object": "chat.completion.chunk", "model": MODEL,
-                        "choices": [], "usage": usage, "metrics": per_request_metrics})
+            final_chunk: dict = {"id": req_id, "object": "chat.completion.chunk", "model": MODEL,
+                                 "choices": [], "usage": usage}
+            if FLAVOR != "strata":
+                # strata 无 chunk.metrics（无逐请求指标字段能力）
+                final_chunk["metrics"] = per_request_metrics
+            send_event(final_chunk)
             done = b"data: [DONE]\n\n"
             self.wfile.write(f"{len(done):X}\r\n".encode() + done + b"\r\n")
             self.wfile.write(b"0\r\n\r\n")
@@ -362,12 +453,17 @@ def write_fake_trace() -> Path:
 
 
 def main() -> int:
+    global FLAVOR
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=18000)
     parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--flavor", choices=("vllm", "strata"), default="vllm",
+                        help="vllm=现状（默认）；strata=模拟 Strata 观测面差异（F3 T3.7）")
     args = parser.parse_args()
+    FLAVOR = args.flavor
     server = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"mock vLLM 服务已启动：http://{args.host}:{args.port}（model={MODEL}）", flush=True)
+    print(f"mock vLLM 服务已启动：http://{args.host}:{args.port}"
+          f"（model={MODEL} flavor={FLAVOR}）", flush=True)
     print(f"trace 输出目录：{TRACE_DIR}", flush=True)
     try:
         server.serve_forever()

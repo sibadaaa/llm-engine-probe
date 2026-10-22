@@ -30,10 +30,12 @@ import threading
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable
 
 from .config import ProbeConfig
+from .engines import has_cap, profile_for_config
 
 # --------------------------------------------------------------------------
 # 负载构造
@@ -157,7 +159,11 @@ def _build_body(cfg: ProbeConfig, prompt: str, max_tokens: int, stream: bool) ->
         body["stream_options"] = {"include_usage": True}
     if cfg.endpoint == "chat":
         body["messages"] = [{"role": "user", "content": prompt}]
-        body["chat_template_kwargs"] = {"reasoning_effort": "low"}
+        # 引擎专属注入走 profile（F3 T3.2）：vllm = 历史硬编码的 chat_template_kwargs
+        # （请求体逐字节一致）；strata = 顶层 reasoning_effort（上游语义）。
+        profile = profile_for_config(cfg)
+        if profile.chat_body_extras:
+            body.update(deepcopy(profile.chat_body_extras))
     else:
         body["prompt"] = prompt
     return body
@@ -177,6 +183,8 @@ def request_once(
         prompt = build_prompt(cfg.prompt_tokens, cfg.shared_prefix_tokens, index)
 
     result = RequestResult(index=index, started_at=time.time())
+    # 引擎 profile 的 delta 内容键（TTFT/ITL 计数依据；一次请求内固定）
+    profile_delta_keys = tuple(profile_for_config(cfg).delta_content_keys)
     conn = None
     try:
         conn, prefix = _open_connection(cfg)
@@ -226,7 +234,7 @@ def request_once(
             except json.JSONDecodeError:
                 continue
             now = time.perf_counter()
-            has_content = _absorb_chunk(result, chunk)
+            has_content = _absorb_chunk(result, chunk, content_keys=profile_delta_keys)
             if has_content:
                 if first_content_ms is None:
                     first_content_ms = (now - t0) * 1000.0
@@ -272,21 +280,28 @@ def _absorb_payload(result: RequestResult, payload: dict[str, Any]) -> None:
     result.request_id = result.request_id or payload.get("id")
 
 
-def _absorb_chunk(result: RequestResult, chunk: dict[str, Any]) -> bool:
-    """流式 chunk：返回该块是否携带了新的输出内容（含 reasoning）。"""
+def _absorb_chunk(
+    result: RequestResult,
+    chunk: dict[str, Any],
+    content_keys: Iterable[str] = ("content", "reasoning_content", "reasoning"),
+) -> bool:
+    """流式 chunk：返回该块是否携带了新的输出内容（含 reasoning）。
+
+    ``content_keys`` 来自引擎 profile 的 ``delta_content_keys``（F3 T3.2）：
+    vLLM 引擎是 content / reasoning_content / reasoning 三键（DeepSeek 系与
+    qwen3 reasoning parser 的历史形态）；Strata 等引擎按 profile 声明子集。
+    fallback 到 ``choice.text``（completions 形态）与 usage / finish_reason 的
+    通用逻辑与引擎无关，保持不变。
+    """
     got_content = False
     for choice in chunk.get("choices") or []:
         delta = choice.get("delta") or {}
-        # 注意 delta 键名的三种形态：OpenAI 的 content、DeepSeek 系的
-        # reasoning_content、以及 vLLM 本仓库 reasoning parser（qwen3）输出的
-        # **reasoning**。现网 qwen3.8-27b 在 reasoning_effort=low 时前若干个 chunk
-        # 全部走 reasoning 键；漏掉它会导致客户端 TTFT/ITL 全是 None（实测踩过）。
-        text = (
-            delta.get("content")
-            or delta.get("reasoning_content")
-            or delta.get("reasoning")
-            or ""
-        )
+        text = ""
+        for key in content_keys:
+            value = delta.get(key)
+            if value:
+                text = value
+                break
         if not text and choice.get("text"):
             text = choice["text"]
         if text:
@@ -391,17 +406,35 @@ def summarize(results: list[RequestResult], cfg: ProbeConfig) -> dict[str, Any]:
             else None
         ),
         "cached_tokens": [r.cached_tokens for r in ok if r.cached_tokens is not None],
-        "server_side": _server_side_summary(ok),
-        "spec_decode": _spec_decode_summary(ok),
+        # 逐请求指标摘要仅当引擎声明 obs.per-request-metrics 才解析（F3 T3.2）；
+        # vLLM 恒有能力位 → 行为不变。
+        "server_side": _server_side_summary(
+            ok, engine_supports=_engine_supports_per_request(cfg)
+        ),
+        "spec_decode": _spec_decode_summary(
+            ok, engine_supports=_engine_supports_per_request(cfg)
+        ),
         "throughput": _throughput(results, ok, cfg),
     }
     return summary
 
 
-def _server_side_summary(ok: list[RequestResult]) -> dict[str, Any]:
+def _engine_supports_per_request(cfg: ProbeConfig) -> bool:
+    """引擎是否声明 obs.per-request-metrics（无能力时逐请求摘要直接给 available:False）。"""
+    return has_cap(profile_for_config(cfg), "obs.per-request-metrics")
+
+
+def _server_side_summary(
+    ok: list[RequestResult], *, engine_supports: bool = True
+) -> dict[str, Any]:
     """服务端 ``--enable-per-request-metrics`` 给出的逐请求指标聚合。"""
     rows = [r.server_metrics for r in ok if r.server_metrics]
     if not rows:
+        if not engine_supports:
+            return {
+                "available": False,
+                "hint": "引擎不提供逐请求 metrics 字段（无 obs.per-request-metrics 能力）",
+            }
         return {"available": False, "hint": "服务端未开启 --enable-per-request-metrics"}
     out: dict[str, Any] = {"available": True, "requests": len(rows)}
     for key in (
@@ -421,9 +454,17 @@ def _server_side_summary(ok: list[RequestResult]) -> dict[str, Any]:
     return out
 
 
-def _spec_decode_summary(ok: list[RequestResult]) -> dict[str, Any]:
+def _spec_decode_summary(
+    ok: list[RequestResult], *, engine_supports: bool = True
+) -> dict[str, Any]:
     rows = [r.spec_decode for r in ok if r.spec_decode]
     if not rows:
+        if not engine_supports:
+            return {
+                "available": False,
+                "hint": "引擎不提供逐请求投机解码指标（无 obs.per-request-metrics 能力；"
+                        "/metrics 级 draft/accepted 计数器若引擎提供会出现在 metrics 快照里）",
+            }
         return {"available": False, "hint": "需要 --per-request-spec-decode-metrics summary|detailed 且启用投机解码"}
     hist_len = max((len(row.get("acceptance_histogram") or []) for row in rows), default=0)
     hist = [0] * hist_len

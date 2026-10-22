@@ -128,12 +128,20 @@ fi
 # 1 = 停止后跳过显存释放等待（测试/CI/同机已有其它显存占用时很有用）
 : "${PROBE_SKIP_VRAM_WAIT:=0}"
 
+# --- 引擎组件（engines/<id>.sh ↔ probe/engines.py，双端键集合由 tests/test_engines.py 守卫）---
+# 引擎组件 = 提供服务进程的软件（替换 serve 入口）；与厂商 VENDOR 正交。
+: "${ENGINE:=vllm}"                    # 引擎组件 id；不设置（或 vllm）时行为与历史版本一致
+: "${EXTRA_ENGINE_ARGS:=}"             # 引擎无关的追加参数（末尾追加；对 vLLM 与 EXTRA_VLLM_ARGS 等效合并）
+: "${HOST_ENGINE_PATTERN:=}"           # 显式覆盖进程正则；优先级 显式 > 引擎 profile > HOST_VLLM_PATTERN
+: "${PROBE_ENGINE_EXTRAS:=0}"          # 1 = probe metrics 采集引擎专有指标（如 strata:*，F3 T3.8）
+
 export IMAGE CONTAINER MODE EXEC_CONTAINER SRC_DIR MODEL SERVED_NAME HOST PORT TP DTYPE
 export GPU_MEM_UTIL MAX_MODEL_LEN MAX_NUM_BATCHED_TOKENS MAX_NUM_SEQS EAGER VISIBLE_DEVICES
 export DRAFT_MODEL SPEC_METHOD SPEC_TOKENS PROBE_LEVEL RUNS_DIR WARMUP_TIMEOUT
 export RUNTIME HOST_PYTHON HOST_SERVE_ENTRYPOINT HOST_PRECHECK HOST_PRELUDE_FILES
 export HOST_STOP_TIMEOUT HOST_VLLM_PATTERN PYSPY_BIN PROBE_SKIP_VRAM_WAIT
 export VLLM_API_KEY PROBE_LOG_FILE
+export ENGINE EXTRA_ENGINE_ARGS HOST_ENGINE_PATTERN PROBE_ENGINE_EXTRAS
 
 # ---------------------------------------------------------------------------
 # 厂商适配层（vendors/<id>.sh ↔ probe/vendors.py）
@@ -277,6 +285,70 @@ vendor_prelude_shell() {
 }
 
 # ---------------------------------------------------------------------------
+# 引擎组件层（engines/<id>.sh ↔ probe/engines.py）
+#   引擎组件 = 提供服务进程的软件（替换 serve 入口）；与厂商 VENDOR 正交。
+#   profile 与 vendors/*.sh 同纪律：只允许变量赋值/函数定义，source 必须无副作用。
+#   双端键集合一致性由 tests/test_engines.py 守卫。
+# ---------------------------------------------------------------------------
+ENGINES_DIR="$PROJECT_ROOT/engines"
+export ENGINES_DIR
+
+engine_list() {
+  local f base
+  for f in "$ENGINES_DIR"/*.sh; do
+    base="$(basename "$f" .sh)"
+    [[ "$base" == _* ]] && continue
+    printf '%s\n' "$base"
+  done
+}
+
+engine_profile_path() {
+  printf '%s/engines/%s.sh' "$PROJECT_ROOT" "$1"
+}
+
+# 解析 ENGINE 并加载 profile（仿 load_vendor_profile：直接 source 进当前 shell）。
+# 设定 ENGINE_ID/ENGINE_LABEL/ENGINE_CAPS/... 全部 ENGINE_* 变量；未知 ENGINE die。
+# 调用时机：start_vllm.sh 读入配置后立即调用（runtime 归一化之后、必填校验之前）。
+engine_meta() {
+  local id="${ENGINE:-vllm}"
+  [[ -f "$(engine_profile_path "$id")" ]] \
+    || die "未知引擎 ENGINE=$id（可用：$(engine_list | paste -sd' ' -)；接入方法见 docs/design/README.md §4）"
+  # shellcheck disable=SC1090
+  source "$(engine_profile_path "$id")"
+  [[ "$ENGINE_ID" == "$id" ]] \
+    || die "engines/$id.sh 的 ENGINE_ID=$ENGINE_ID 与文件名不一致（契约见 设计.md §4.1）"
+  # 必填字段校验：缺字段在加载期就报清楚，而不是后面 set -u 下崩出 unbound variable
+  local key
+  for key in ENGINE_LABEL ENGINE_CAPS ENGINE_METRICS_FLAVOR ENGINE_ARGS_MODE; do
+    [[ -n "${!key:-}" ]] \
+      || die "engines/$id.sh 缺必填字段 $key（契约见 docs/design/component-interface/设计.md §4.1）"
+  done
+  : "${ENGINE_LABEL:=$id}"
+  : "${ENGINE_HEALTH_PATH:=/health}"
+  : "${ENGINE_MODELS_PATH:=/v1/models}"
+  : "${ENGINE_METRICS_FLAVOR:=vllm-named}"
+  : "${ENGINE_ARGS_MODE:=vllm-cli}"
+  : "${ENGINE_READY_METRIC:=}"
+  : "${ENGINE_METRICS_FETCH_SUFFIX:=}"
+  : "${ENGINE_VERSION_CMD:=}"
+  : "${ENGINE_CHECK_SEVERITY:=fail}"
+  : "${ENGINE_DOCKER_IMAGE:=}"
+  : "${ENGINE_NOTES:=}"
+  export ENGINE ENGINE_ID ENGINE_LABEL ENGINE_ENTRYPOINT ENGINE_PROCESS_PATTERN
+  export ENGINE_HEALTH_PATH ENGINE_MODELS_PATH ENGINE_METRICS_FLAVOR ENGINE_ARGS_MODE
+  export ENGINE_READY_METRIC ENGINE_METRICS_FETCH_SUFFIX ENGINE_VERSION_CMD
+  export ENGINE_CHECK_SEVERITY ENGINE_DOCKER_IMAGE ENGINE_CAPS ENGINE_NOTES
+}
+
+# 能力位判定：$ENGINE_CAPS（空格分隔）里是否含某个能力键（返回 0/1）。
+# 按词**精确整词**匹配：不用 grep -qw —— 能力键含 '.'/'-'（如 obs.step-log），
+# -w 的词边界判定会把 "obs.step" 误判成 "obs.step-log" 的词；先按空白拆行再整行比对。
+engine_has_cap() {
+  # shellcheck disable=SC2086  # 这里的整词拆分是刻意行为
+  printf '%s\n' ${ENGINE_CAPS:-} | grep -qxF -- "$1"
+}
+
+# ---------------------------------------------------------------------------
 # 日志
 # ---------------------------------------------------------------------------
 if [[ -t 1 ]]; then
@@ -387,12 +459,30 @@ host_python() {
   printf '%s' "${HOST_PYTHON:-python3}"
 }
 
-# host 模式的 vLLM 启动入口（与容器内 SERVE_ENTRYPOINT 等价，只是换成宿主机 python）
+# host 模式的 serve 启动入口。优先级：
+#   HOST_SERVE_ENTRYPOINT（显式/模板）> ENGINE_ENTRYPOINT（引擎 profile）> vLLM 内置默认
+# （ENGINE=vllm 时 ENGINE_ENTRYPOINT 为空，行为与历史版本逐字节一致）
 host_serve_entrypoint() {
   if [[ -n "${HOST_SERVE_ENTRYPOINT:-}" ]]; then
     printf '%s' "$HOST_SERVE_ENTRYPOINT"
+  elif [[ -n "${ENGINE_ENTRYPOINT:-}" ]]; then
+    printf '%s' "$ENGINE_ENTRYPOINT"
   else
     printf "%s -c 'import torch; from vllm.entrypoints.cli.main import main; main()'" "$(host_python)"
+  fi
+}
+
+# 进程查找/清理正则（stop/status/pyspy 共用）。优先级链（设计.md §4.3）：
+#   HOST_ENGINE_PATTERN（显式环境/模板）> ENGINE_PROCESS_PATTERN（引擎 profile）
+#   > HOST_VLLM_PATTERN（旧键默认，保留兼容）
+# 未调用 engine_meta 时 ENGINE_PROCESS_PATTERN 为空，自动回落 HOST_VLLM_PATTERN（原行为）。
+engine_process_pattern() {
+  if [[ -n "${HOST_ENGINE_PATTERN:-}" ]]; then
+    printf '%s' "$HOST_ENGINE_PATTERN"
+  elif [[ -n "${ENGINE_PROCESS_PATTERN:-}" ]]; then
+    printf '%s' "$ENGINE_PROCESS_PATTERN"
+  else
+    printf '%s' "${HOST_VLLM_PATTERN:-}"
   fi
 }
 
@@ -516,6 +606,7 @@ write_minimal_run_meta() {
   fi
   RUN_META_DIR="$run_dir" RUNTIME_VALUE="$runtime" PORT_VALUE="$PORT" PROBE_LEVEL_VALUE="$PROBE_LEVEL" \
   VENDOR_VALUE="$VENDOR" VENDOR_LABEL_VALUE="$VENDOR_LABEL" MODEL_VALUE="$MODEL" \
+  ENGINE_VALUE="${ENGINE:-vllm}" \
   SERVED_NAME_VALUE="$SERVED_NAME" IMAGE_VALUE="$IMAGE" CONTAINER_VALUE="$CONTAINER" \
   TP_VALUE="$TP" MAXLEN_VALUE="$MAX_MODEL_LEN" MBT_VALUE="$MAX_NUM_BATCHED_TOKENS" \
   EAGER_VALUE="$EAGER" HOST_META_JSON="$host_json" PROBE_LOG_FILE_VALUE="${PROBE_LOG_FILE:-}" \
@@ -540,6 +631,10 @@ meta = {
     "enforce_eager": os.environ.get("EAGER_VALUE") == "1",
     "note": "由脚本自动生成（实例未经过 start_vllm.sh，模型/参数等字段请以实际进程为准）",
 }
+# 引擎身份：非 vLLM 引擎才写（与 start_vllm.sh 的 run_meta 门控一致，默认路径产物不变）
+engine_id = os.environ.get("ENGINE_VALUE", "vllm")
+if engine_id != "vllm":
+    meta["engine"] = engine_id
 if runtime == "host":
     try:
         host = json.loads(os.environ.get("HOST_META_JSON") or "{}")
@@ -707,7 +802,7 @@ host_stop() {
 # 按进程名强杀宿主机上所有匹配 vLLM 的进程（等价容器 --kill-exec 的语义，慎用：
 # 会误伤其它实验，包括不是本工具启动的 vLLM）。
 host_stop_pattern() {
-  local pattern="${1:-$HOST_VLLM_PATTERN}"
+  local pattern="${1:-$(engine_process_pattern)}"
   local -a pids=() live=() remain=()
   mapfile -t pids < <(pgrep -f "$pattern" 2>/dev/null || true)
   local p
@@ -749,7 +844,7 @@ host_vllm_pids() {
     [[ -n "$p" ]] || continue
     if [[ "$p" == "$$" || "$p" == "$PPID" ]]; then continue; fi
     printf '%s\n' "$p"
-  done < <(pgrep -f "$HOST_VLLM_PATTERN" 2>/dev/null || true)
+  done < <(pgrep -f "$(engine_process_pattern)" 2>/dev/null || true)
   return 0
 }
 
@@ -842,7 +937,9 @@ wait_http() {
   local waited=0
   while (( waited < timeout )); do
     local code
-    code="$(curl -s -o /dev/null -w '%{http_code}' -m 5 "$url" 2>/dev/null || echo 000)"
+    # curl 连接失败时 -w 会自己输出 000；`|| echo 000` 会拼成 000000（永远匹配不到 200，
+    # 行为碰巧正确但语义错误）——用 `|| true` 保留 curl 的 000 即可。
+    code="$(curl -s -o /dev/null -w '%{http_code}' -m 5 "$url" 2>/dev/null || true)"
     if [[ "$code" == "$expect" ]]; then
       return 0
     fi
@@ -861,4 +958,59 @@ quote_argv() {
     out+="$(printf '%q' "$arg") "
   done
   printf '%s' "${out% }"
+}
+
+# ---------------------------------------------------------------------------
+# 引擎就绪等待（start_vllm.sh 与 wait_ready.sh 共用，避免两份实现漂移）
+# ---------------------------------------------------------------------------
+# 就绪指标：显式 VENDOR_READY_METRIC（厂商/用户定制）> ENGINE_READY_METRIC（引擎 profile）
+# > 厂商默认。VENDOR_READY_METRIC 仍是库存 vLLM 默认值时视为"未显式定制"，允许引擎覆盖。
+# 已知边界：用户显式把 VENDOR_READY_METRIC 设成库存默认值时仍会被引擎 profile 覆盖；
+# 厂商 profile 自定义的就绪指标优先于引擎 profile（厂商硬件语义）。
+engine_ready_metric() {
+  if [[ -n "${ENGINE_READY_METRIC:-}" && "${VENDOR_READY_METRIC:-}" == "^vllm:cache_config_info" ]]; then
+    printf '%s' "$ENGINE_READY_METRIC"
+  else
+    printf '%s' "${VENDOR_READY_METRIC:-}"
+  fi
+}
+
+# wait_engine_ready <base_url> <timeout_s>
+# 就绪判定：/health 200（无 api.health 能力的引擎退化为端口连通性探测）+
+# /metrics 出现就绪指标（无 /metrics 面的引擎跳过；指标等待最多 120s，超时也视为就绪，
+# 与 start_vllm.sh 的既有 DO_WAIT 语义一致）。/health 超时返回 1（调用方决定 die）。
+# 需要先 engine_meta（ENGINE_CAPS / ENGINE_* 字段）。
+wait_engine_ready() {
+  local base="$1" timeout="${2:-900}"
+  local code started
+  started="$(date +%s)"
+  if engine_has_cap api.health; then
+    while :; do
+      # curl 连接失败时 -w 会自己输出 000；`|| echo 000` 会拼成 000000（勿用）
+      code="$(curl -s -o /dev/null -w '%{http_code}' -m 5 "$base${ENGINE_HEALTH_PATH:-/health}" 2>/dev/null || true)"
+      if [[ "$code" == "200" ]]; then break; fi
+      if (( $(date +%s) - started > timeout )); then return 1; fi
+      sleep 5
+    done
+  else
+    while :; do
+      code="$(curl -s -o /dev/null -w '%{http_code}' -m 5 "$base" 2>/dev/null || true)"
+      if [[ "$code" != "000" ]]; then break; fi
+      if (( $(date +%s) - started > timeout )); then return 1; fi
+      sleep 5
+    done
+  fi
+  if engine_has_cap metrics.vllm-named || engine_has_cap metrics.prometheus; then
+    local ready_metric metrics_waited=0
+    ready_metric="$(engine_ready_metric)"
+    while :; do
+      if curl -s -m 5 "$base/metrics${ENGINE_METRICS_FETCH_SUFFIX:-}" 2>/dev/null | grep -qE "$ready_metric"; then
+        break
+      fi
+      if (( metrics_waited >= 120 )); then break; fi
+      sleep 5
+      metrics_waited=$((metrics_waited + 5))
+    done
+  fi
+  return 0
 }

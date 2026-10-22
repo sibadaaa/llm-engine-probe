@@ -96,7 +96,8 @@ hosts/
 ├── scenario/*.env               # 场景：模型/并行/长度/吞吐/端口
 ├── quant/*.env                  # 量化：FP8 / INT8 W8A8 / W4A16 / AWQ
 ├── spec/*.env                   # 投机解码：dflash / mtp / eagle / ngram
-└── deploy/                      # 部署形态：systemd / 外部实例 / PD / 多机（实验性）
+├── deploy/                      # 部署形态：systemd / 外部实例 / PD / 多机（实验性）
+└── engine/                      # 引擎组件：ENGINE 切换 + 引擎语义的模型/并行参数
 ```
 
 ### 3.1 厂商模板（`vendor/`）
@@ -167,6 +168,31 @@ PD/多机模板**默认拒绝直接启动**：脚本先检查必需变量（KV c
 并把最终命令打印出来；确认无误后再按 README 打开闸门。原因见各 README 的「为什么默认不启动」。
 deploy 模板**保留上游** `EXTRA_VLLM_ARGS`（worker 只追加 `--headless`），不会重置场景/厂商参数。
 
+### 3.8 引擎模板（`engine/`）
+
+引擎模板切换 `ENGINE`（引擎组件 = 提供服务进程的软件，与厂商 `VENDOR` 正交；注册表在
+`engines/<id>.sh` ↔ `probe/engines.py`，契约见
+[`docs/design/component-interface/设计.md`](../docs/design/component-interface/设计.md) §4/§9）。
+
+| 模板 | 用途 | 关键设置 |
+|---|---|---|
+| [`engine/vllm.env`](engine/vllm.env) | 显式声明 vLLM（占位语义，与不设置等价） | `ENGINE=vllm` |
+| [`engine/strata.env`](engine/strata.env) | 切换到 Strata（MoE 专家分层推理引擎，结构适配） | `ENGINE=strata`、`MODEL` 换成 pack 名、`HOST_ENGINE_PATTERN`（真机核对项见 `docs/design/strata-engine/施工图.md` §4） |
+
+**链序约定**：引擎模板放最后——`vendor → scenario → quant/spec（vLLM 专属）→ engine`。
+引擎模板负责把模型/并行参数换成该引擎的语义（如 Strata 的 `MODEL` 是 pack 名不是权重路径），
+因此要能覆盖前面模板的 vLLM 语义取值：
+
+```bash
+hosts/vllm-host.sh up engine/strata                     # 单模板
+hosts/vllm-host.sh up vendor/nvidia engine/strata       # 显式指定厂商做遥测
+```
+
+> 注意：非 vLLM 引擎在 `RUNTIME=docker` 下会被启动链显式拒绝（无官方镜像，
+> 见 `docs/design/README.md` §5 红线 3）；外部已运行的引擎实例请用
+> `deploy/external-probe.sh` 只读探测。Strata 的完整使用说明（外部只读/host 拉起、
+> 压测语义差异、排障）见 [`../docs/strata-接入指南.md`](../docs/strata-接入指南.md)。
+
 ---
 
 ## 4. 与 Docker 模式的对照
@@ -193,6 +219,9 @@ deploy 模板**保留上游** `EXTRA_VLLM_ARGS`（worker 只追加 `--headless`�
    `hosts/vllm-host.sh dry-run <名字>`；
 5. 在 [`hosts/README.md`](README.md) 的索引表加一行。
 
+**引擎模板（`engine/`）特殊约定**：引擎模板负责把模型/并行参数换成引擎语义，放链序最后；
+新引擎的接入三步见 `docs/design/README.md` §4（profile + 模板 + 两行索引）。
+
 模板文件是 shell 片段，会被 `source`。**不要**在模板里执行命令、`cd`、写文件或改
 `HOST_PYTHON`/`RUNS_DIR` 这类机器相关路径——那会让 `show`/`dry-run` 产生副作用。
 
@@ -212,8 +241,11 @@ bash tests/run_tests.sh                 # 全量测试（会包含上面的模�
 * 显式环境 > 模板链 > `.env` 的优先级；
 * 每个模板单独 `dry-run` 能生成 `serve_launch.sh`，且关键参数（TP、模型、投机解码、
   量化、可见卡）出现在命令行里；
-* `scripts/` 无模板引入的额外改动（自测允许 `start_vllm.sh` 的 host prelude `set +u`
-  兼容修复；其它 `scripts/` 改动会判失败）。
+* `scripts/` 无模板引入的额外改动（自测白名单当前放行：`start_vllm.sh` 的 host prelude
+  `set +u` 兼容修复与引擎 caps 门禁收拢、`lib/common.sh` 的引擎组件层与就绪等待共享函数、
+  `stop_vllm.sh` / `status.sh` / `pyspy.sh` / `wait_ready.sh` 的引擎感知改动
+  （见 `docs/design/component-interface/施工图.md` 与 F3 评审修复）；
+  其它 `scripts/` 改动会判失败，扩展白名单须同步更新此处描述）。
 
 ---
 
@@ -225,3 +257,6 @@ bash tests/run_tests.sh                 # 全量测试（会包含上面的模�
 * 模板只适用于 `RUNTIME=host`；Docker 模式请继续用 `docker/docker-compose.*.yml`。
 * 同一端口同时只能有一个实例；场景模板给了 8101/8102/8103 便于并存调试，但仍受显存约束。
 * PD/多机模板是**骨架**，需要按你的 KV connector、网卡、vLLM 版本补齐；不要直接上生产。
+* 引擎模板（`engine/`）里的非 vLLM 条目（如 `engine/strata.env`）是**结构适配**：
+  进程正则、版本命令、就绪指标等取值为占位，真机核对项见
+  [`docs/design/strata-engine/施工图.md`](../docs/design/strata-engine/施工图.md) §4。

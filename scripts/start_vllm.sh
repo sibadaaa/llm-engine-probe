@@ -9,6 +9,11 @@
 # vendors/<id>.sh（VENDOR=auto 时自动探测，见 vendors/README.md）。
 # 观测档位与厂商、运行时均无关，见下。
 #
+# 多引擎：ENGINE=vllm（默认）| strata | …；引擎组件 = 提供服务进程的软件，
+# 注册表在 engines/<id>.sh（shell）↔ probe/engines.py（Python），差异走能力位
+# （caps）协商而非 ENGINE 分支——契约见 docs/design/component-interface/设计.md，
+# 新引擎接入三步见 docs/design/README.md §4。
+#
 # 用法：
 #   scripts/start_vllm.sh                        # 按 .env 的 RUNTIME/PROBE_LEVEL 启动
 #   scripts/start_vllm.sh --host                 # 物理机裸跑（等价 RUNTIME=host）
@@ -54,7 +59,7 @@ while [[ $# -gt 0 ]]; do
     --docker) RUNTIME=docker; shift ;;
     --runtime) RUNTIME="${2:?}"; shift 2 ;;
     --skip-check) SKIP_CHECK=1; shift ;;
-    -h|--help) sed -n '2,31p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,35p' "$0"; exit 0 ;;
     *) die "未知参数：$1（-h 查看用法）" ;;
   esac
 done
@@ -71,6 +76,32 @@ if runtime_is_host; then
   [[ "$MODE" == "run" ]] || die "RUNTIME=host 不支持 MODE=$MODE（MODE=exec 只用于复用已有容器；host 模式请去掉 --exec）"
 else
   case "$MODE" in run|exec) ;; *) die "MODE 非法：$MODE（run|exec）" ;; esac
+fi
+
+# ---------------------------------------------------------------------------
+# 引擎组件：加载 profile + caps 门禁（docs/design/component-interface/设计.md §7）
+# ENGINE 未设置 / =vllm 时全部检查直通，拼装结果与历史版本逐字节一致。
+# ---------------------------------------------------------------------------
+engine_meta
+if ! engine_has_cap runtime.docker && runtime_is_docker; then
+  die "ENGINE=$ENGINE 该引擎暂无 docker 支持（engines/$ENGINE.sh 未声明 runtime.docker；docker 支持为暂缓项，见 docs/design/README.md §5 红线 3）；请用 RUNTIME=host 或外部只读探测（deploy/external-probe.sh）"
+fi
+if [[ -n "$DRAFT_MODEL" || -n "$SPEC_METHOD" ]] && ! engine_has_cap spec.decode; then
+  die "ENGINE=$ENGINE 不支持投机解码（无 spec.decode 能力）：请清空 DRAFT_MODEL/SPEC_METHOD，或改用该引擎自己的投机解码配置面"
+fi
+if [[ "$LEVEL" == "steps" || "$LEVEL" == "deep" ]] && ! engine_has_cap obs.step-log; then
+  warn "ENGINE=$ENGINE 不支持逐 step 日志观测（无 obs.step-log 能力）：PROBE_LEVEL=$LEVEL 降级为 basic"
+  LEVEL="basic"
+fi
+if [[ "$LEVEL" == "kernel" ]] && ! engine_has_cap obs.trace-pytorch; then
+  die "ENGINE=$ENGINE 不支持 torch profiler kernel 档（无 obs.trace-pytorch 能力，降级没有意义）：请用 deep/steps/basic 档"
+fi
+if [[ "$PROBE_PLUGIN" == "1" ]] && ! engine_has_cap obs.step-log; then
+  warn "ENGINE=$ENGINE 不支持逐 step 日志/插件观测（无 obs.step-log 能力）：PROBE_PLUGIN 置 0"
+  PROBE_PLUGIN=0
+fi
+if [[ "$PROBE_ENDPOINT" == "completions" ]] && ! engine_has_cap api.openai-completions; then
+  die "ENGINE=$ENGINE 不提供 /v1/completions（无 api.openai-completions 能力）：PROBE_ENDPOINT=completions 无法使用，请改 PROBE_ENDPOINT=chat"
 fi
 
 [[ -n "$MODEL" ]] || die "MODEL 未设置：请在 .env 里指定模型目录（参考 .env.example）"
@@ -97,8 +128,29 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 1. 服务参数（docker/host 完全共用）
+# 1+2. 服务参数与观测开关（vLLM CLI 形态）
+#   整段 flag/env 拼装是 vLLM 引擎的 `serve` 子命令形态（ENGINE_ARGS_MODE=vllm-cli，
+#   由引擎 profile 声明）；custom 模式的引擎（无 vLLM CLI 语义）跳过全部 vLLM
+#   flag 块，只用 EXTRA_ENGINE_ARGS/EXTRA_ARGS_FILE 追加与 MODEL/SERVED_NAME/PORT
+#   等记录性字段（docs/design/component-interface/设计.md §7.2）。
+#   ENGINE=vllm 时本门禁恒真，拼装结果与历史版本逐字节一致。
 # ---------------------------------------------------------------------------
+ARGS=()
+SPEC_DECODE_ON=0
+
+# ENV_KVS 是唯一的 K=V 来源：docker 侧再派生成 -e，host 侧写进 serve_launch.sh。
+ENV_KVS=()
+add_env() { ENV_KVS+=("$1"); }
+
+case "$LEVEL" in
+  off)   LEVEL_DESC="关闭全部可选观测开关（对照基线）" ;;
+  basic) LEVEL_DESC="默认周期 stats（VLLM_LOG_STATS_INTERVAL=${LOG_STATS_INTERVAL}s）+ /metrics" ;;
+  steps) LEVEL_DESC="逐 iteration 明细 + 逐请求日志 + 逐请求 metrics 字段" ;;
+  deep)  LEVEL_DESC="steps + KV block 驻留 + 图调度统计 + MFU + 逐步投机解码指标" ;;
+  kernel) LEVEL_DESC="deep + torch profiler + 逐层 NVTX（会自动关闭图模式）" ;;
+esac
+
+if [[ "$ENGINE_ARGS_MODE" == "vllm-cli" ]]; then
 ARGS=(serve "$MODEL"
   --served-model-name "$SERVED_NAME"
   --host "$HOST" --port "$INTERNAL_PORT"
@@ -111,9 +163,8 @@ ARGS=(serve "$MODEL"
 )
 [[ "$EAGER" == "1" ]] && ARGS+=(--enforce-eager)
 
-# 投机解码（可选）
-SPEC_DECODE_ON=0
-if [[ -n "$DRAFT_MODEL" ]]; then
+# 投机解码（可选；spec.decode 门禁与开头的能力检查双保险，防模板链中途覆盖）
+if [[ -n "$DRAFT_MODEL" ]] && engine_has_cap spec.decode; then
   SPEC_DECODE_ON=1
   SPEC="{\"model\":\"$DRAFT_MODEL\",\"method\":\"$SPEC_METHOD\",\"num_speculative_tokens\":$SPEC_TOKENS"
   [[ -n "${SPEC_DTYPE:-}" ]] && SPEC="$SPEC,\"dtype\":\"$SPEC_DTYPE\""
@@ -122,21 +173,6 @@ if [[ -n "$DRAFT_MODEL" ]]; then
   SPEC="$SPEC}"
   ARGS+=(--speculative-config "$SPEC")
 fi
-
-# ---------------------------------------------------------------------------
-# 2. 观测开关（按档位叠加；与厂商、运行时无关）
-# ---------------------------------------------------------------------------
-# ENV_KVS 是唯一的 K=V 来源：docker 侧再派生成 -e，host 侧写进 serve_launch.sh。
-ENV_KVS=()
-add_env() { ENV_KVS+=("$1"); }
-
-case "$LEVEL" in
-  off)   LEVEL_DESC="关闭全部可选观测开关（对照基线）" ;;
-  basic) LEVEL_DESC="默认周期 stats（VLLM_LOG_STATS_INTERVAL=${LOG_STATS_INTERVAL}s）+ /metrics" ;;
-  steps) LEVEL_DESC="逐 iteration 明细 + 逐请求日志 + 逐请求 metrics 字段" ;;
-  deep)  LEVEL_DESC="steps + KV block 驻留 + 图调度统计 + MFU + 逐步投机解码指标" ;;
-  kernel) LEVEL_DESC="deep + torch profiler + 逐层 NVTX（会自动关闭图模式）" ;;
-esac
 
 if [[ "$LEVEL" != "off" ]]; then
   add_env "VLLM_LOGGING_LEVEL=$VLLM_LOGGING_LEVEL"
@@ -199,6 +235,7 @@ if [[ "$LEVEL" == "kernel" ]]; then
   fi
   log "profiler 已启用：启动后 POST /start_profile 开始采集，POST /stop_profile 落盘到 $TRACE_DIR"
 fi
+fi  # end ENGINE_ARGS_MODE=vllm-cli
 
 # ---------------------------------------------------------------------------
 # 可选：stat logger 插件（plugin_probe/）——把每个 engine step 的结构化统计写成 JSONL
@@ -207,7 +244,7 @@ fi
 # ---------------------------------------------------------------------------
 PLUGIN_SETUP=""
 PROBE_LOG_PATH=""
-if [[ "$PROBE_PLUGIN" == "1" ]]; then
+if [[ "$PROBE_PLUGIN" == "1" ]] && engine_has_cap obs.step-log; then
   if [[ "$LEVEL" == "off" || "$LEVEL" == "basic" ]]; then
     warn "PROBE_PLUGIN=1 但档位是 $LEVEL：逐 step 明细需要 --enable-logging-iteration-details，建议用 steps/deep/kernel"
   fi
@@ -236,10 +273,18 @@ else
   log "stat logger 插件：关（PROBE_PLUGIN=1 可开启；提供最细的逐 step/逐请求结构化数据）"
 fi
 
-# 用户自定义参数：EXTRA_VLLM_ARGS 按空白切分；EXTRA_ARGS_FILE 每行一个参数（JSON 参数请用后者）
+# 用户自定义参数：
+#   EXTRA_VLLM_ARGS     vLLM 引擎专用追加键（按空白切分）；custom 模式引擎忽略并打 ⚠️
+#                       （键名含 vllm，误用大概率是模板叠错——设计.md §4.3）
+#   EXTRA_ARGS_FILE     每行一个参数（引擎无关；JSON 参数请用后者）
+#   EXTRA_ENGINE_ARGS   引擎无关追加键（末尾追加；对 vLLM 与 EXTRA_VLLM_ARGS 等效合并）
 if [[ -n "$EXTRA_VLLM_ARGS" ]]; then
-  # shellcheck disable=SC2206
-  ARGS+=($EXTRA_VLLM_ARGS)
+  if [[ "$ENGINE_ARGS_MODE" == "vllm-cli" ]]; then
+    # shellcheck disable=SC2206
+    ARGS+=($EXTRA_VLLM_ARGS)
+  else
+    warn "ENGINE=$ENGINE（$ENGINE_ARGS_MODE 模式）忽略 EXTRA_VLLM_ARGS（键名含 vllm，误用大概率是模板叠错）；追加参数请改用 EXTRA_ENGINE_ARGS"
+  fi
 fi
 if [[ -n "${EXTRA_ARGS_FILE:-}" ]]; then
   [[ -f "$EXTRA_ARGS_FILE" ]] || die "EXTRA_ARGS_FILE 不存在：$EXTRA_ARGS_FILE"
@@ -247,6 +292,10 @@ if [[ -n "${EXTRA_ARGS_FILE:-}" ]]; then
     [[ -z "$line" || "$line" == \#* ]] && continue
     ARGS+=("$line")
   done < "$EXTRA_ARGS_FILE"
+fi
+if [[ -n "$EXTRA_ENGINE_ARGS" ]]; then
+  # shellcheck disable=SC2206
+  ARGS+=($EXTRA_ENGINE_ARGS)
 fi
 
 # ---------------------------------------------------------------------------
@@ -262,16 +311,34 @@ fi
 for kv in "${VENDOR_EXTRA_ENV[@]+"${VENDOR_EXTRA_ENV[@]}"}"; do
   [[ -n "$kv" ]] && add_env "$kv"
 done
-add_env "VLLM_WORKER_MULTIPROC_METHOD=${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
-add_env "TOKENIZERS_PARALLELISM=false"
+# vLLM 专属 env（VLLM_* / TOKENIZERS_PARALLELISM / TRITON 缓存）按 ENGINE_ARGS_MODE 收拢；
+# PYTHONUNBUFFERED / PROMETHEUS_* / EXTRA_ENV 是引擎无关的通用段（设计.md §7.7）。
+if [[ "$ENGINE_ARGS_MODE" == "vllm-cli" ]]; then
+  add_env "VLLM_WORKER_MULTIPROC_METHOD=${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
+  add_env "TOKENIZERS_PARALLELISM=false"
+fi
 add_env "PYTHONUNBUFFERED=1"
-[[ -n "$VLLM_CACHE_ROOT" ]] && add_env "VLLM_CACHE_ROOT=$VLLM_CACHE_ROOT"
-[[ -n "$TRITON_CACHE_DIR" ]] && add_env "TRITON_CACHE_DIR=$TRITON_CACHE_DIR"
-add_env "VLLM_NO_USAGE_STATS=${VLLM_NO_USAGE_STATS:-1}"
+if [[ "$ENGINE_ARGS_MODE" == "vllm-cli" ]]; then
+  [[ -n "$VLLM_CACHE_ROOT" ]] && add_env "VLLM_CACHE_ROOT=$VLLM_CACHE_ROOT"
+  [[ -n "$TRITON_CACHE_DIR" ]] && add_env "TRITON_CACHE_DIR=$TRITON_CACHE_DIR"
+  add_env "VLLM_NO_USAGE_STATS=${VLLM_NO_USAGE_STATS:-1}"
+fi
 if runtime_is_host; then
   add_env "PYTHONPATH=$(host_pythonpath)"
 else
   add_env "PYTHONPATH=$(container_pythonpath)"
+fi
+# 引擎身份进启动环境（非 vLLM 引擎才写，便于事后核对产物归属/复现）：
+# ENGINE=vllm（含显式设置）≡ 不设置，不加这一行——红线 1：vLLM 默认路径 dry-run
+# 产物与施工前基线逐字节一致（docs/design/README.md §5）。
+if [[ "$ENGINE" != "vllm" ]]; then
+  add_env "ENGINE=$ENGINE"
+fi
+# custom 模式引擎：MODEL/SERVED_NAME 是 pack 名/注册名（不进命令行），export 进启动
+# 环境便于复现与核对；vLLM 引擎的模型是 serve 位置参数，保持基线不导出这两个键。
+if [[ "$ENGINE_ARGS_MODE" != "vllm-cli" ]]; then
+  add_env "MODEL=$MODEL"
+  add_env "SERVED_NAME=$SERVED_NAME"
 fi
 [[ -n "${PROMETHEUS_DISABLE_CREATED_SERIES:-}" ]] && add_env "PROMETHEUS_DISABLE_CREATED_SERIES=$PROMETHEUS_DISABLE_CREATED_SERIES"
 if [[ -n "$EXTRA_ENV" ]]; then
@@ -280,11 +347,21 @@ fi
 
 # ---------------------------------------------------------------------------
 # 4. 组装启动命令
+#    入口优先级（设计.md §7.3）：HOST_SERVE_ENTRYPOINT > ENGINE_ENTRYPOINT > 引擎默认
 # ---------------------------------------------------------------------------
 if runtime_is_host; then
   SERVE_ENTRYPOINT_ACTUAL="$(host_serve_entrypoint)"
 else
-  SERVE_ENTRYPOINT_ACTUAL="${SERVE_ENTRYPOINT:-python3 -c 'import torch; from vllm.entrypoints.cli.main import main; main()'}"
+  if [[ "$ENGINE_ARGS_MODE" == "vllm-cli" ]]; then
+    SERVE_ENTRYPOINT_ACTUAL="${SERVE_ENTRYPOINT:-python3 -c 'import torch; from vllm.entrypoints.cli.main import main; main()'}"
+  else
+    # docker 侧非 vLLM 引擎已在 caps 门禁 die；此分支兜底给未来声明了
+    # runtime.docker 的 custom 引擎（ENGINE_ENTRYPOINT 为空时才允许 SERVE_ENTRYPOINT）
+    SERVE_ENTRYPOINT_ACTUAL="${SERVE_ENTRYPOINT:-${ENGINE_ENTRYPOINT:-}}"
+  fi
+fi
+if [[ "$ENGINE_ARGS_MODE" != "vllm-cli" && -z "${HOST_SERVE_ENTRYPOINT:-}${SERVE_ENTRYPOINT:-}${ENGINE_ENTRYPOINT:-}" ]]; then
+  die "ENGINE=$ENGINE（custom 模式）没有可用的启动入口：请在 engines/$ENGINE.sh 声明 ENGINE_ENTRYPOINT，或用 HOST_SERVE_ENTRYPOINT/SERVE_ENTRYPOINT 显式覆盖"
 fi
 CMD_STR="$SERVE_ENTRYPOINT_ACTUAL $(quote_argv "${ARGS[@]}")"
 
@@ -313,10 +390,19 @@ if runtime_is_host; then
   [[ -n "$HOST_META_JSON" ]] || HOST_META_JSON='{"python": null, "python_version": null, "vllm_version": null, "torch_version": null, "hostname": null, "kernel": null}'
 fi
 
+# 引擎版本（best-effort；ENGINE_VERSION_CMD 由引擎 profile 声明，vLLM 走 host_meta 的
+# import 探测——host 段 vllm_version 字段保留，另旁增 engine_version）
+ENGINE_VERSION_VALUE=""
+if runtime_is_host && [[ -n "$ENGINE_VERSION_CMD" ]]; then
+  # shellcheck disable=SC2086  # ENGINE_VERSION_CMD 按空白切分为命令 + 参数
+  ENGINE_VERSION_VALUE="$(host_exec $ENGINE_VERSION_CMD 2>/dev/null | head -n 1 || true)"
+fi
+
 # run_meta.json（供报告读取；docker/host 都有，host 额外带 host 段）
 RUN_META_DIR="$RUN_DIR" MODEL="$MODEL" SERVED_NAME="$SERVED_NAME" PORT="$PORT" TP="$TP" \
 MAX_MODEL_LEN="$MAX_MODEL_LEN" MAX_NUM_BATCHED_TOKENS="$MAX_NUM_BATCHED_TOKENS" EAGER="$EAGER" \
 PROBE_LEVEL="$LEVEL" LEVEL_DESC="$LEVEL_DESC" CONTAINER="$CONTAINER" IMAGE="$IMAGE" \
+ENGINE_VALUE="$ENGINE" ENGINE_LABEL_VALUE="$ENGINE_LABEL" ENGINE_VERSION_VALUE="$ENGINE_VERSION_VALUE" \
 RUNTIME="$RUNTIME" HOST_META_JSON="$HOST_META_JSON" STARTED_AT="$(date -Is)" CMD_STR="$CMD_STR" py - <<'PY'
 import json, os
 runtime = os.environ["RUNTIME"]
@@ -338,6 +424,12 @@ meta = {
     "probe_level_desc": os.environ["LEVEL_DESC"],
     "command": os.environ["CMD_STR"],
 }
+# 引擎身份字段（T1.9）：非 vLLM 引擎才写——ENGINE=vllm（含未设置）时 run_meta 与
+# 施工前基线逐字节一致（design/README.md §5 红线 1）；报告取值链会回落 ENGINE env/默认。
+engine_id = os.environ.get("ENGINE_VALUE", "vllm")
+if engine_id != "vllm":
+    meta["engine"] = engine_id
+    meta["engine_label"] = os.environ.get("ENGINE_LABEL_VALUE", "")
 if runtime == "host":
     keys = ("python", "python_version", "vllm_version", "torch_version", "hostname", "kernel")
     try:
@@ -348,6 +440,9 @@ if runtime == "host":
         meta["host"] = {}
     for k in keys:
         meta["host"].setdefault(k, None)
+    # 引擎版本（ENGINE_VERSION_CMD 输出；空/未声明为 None）。vllm_version 字段保留原名。
+    if engine_id != "vllm":
+        meta["host"]["engine_version"] = os.environ.get("ENGINE_VERSION_VALUE") or None
 open(os.path.join(os.environ["RUN_META_DIR"], "run_meta.json"), "w").write(
     json.dumps(meta, ensure_ascii=False, indent=2)
 )
@@ -370,6 +465,11 @@ if runtime_is_host; then
     echo '#!/usr/bin/env bash'
     echo '# 由 scripts/start_vllm.sh 生成：host（物理机裸跑）启动脚本'
     echo '# 环境变量来自与 docker 模式完全相同的 ENV_KVS，便于复现/对比。'
+    # 引擎身份注记：便于事后核对产物归属（ENGINE=vllm 时不加，保持基线逐字节一致）
+    if [[ "$ENGINE" != "vllm" ]]; then
+      echo "# 引擎：$ENGINE（$ENGINE_LABEL）"
+      echo "# 能力位：$ENGINE_CAPS"
+    fi
     echo 'set -euo pipefail'
     printf 'cd %q\n' "$WORKDIR"
     if [[ -n "$HOST_PRELUDE" ]]; then
@@ -569,17 +669,14 @@ fi
 if (( DO_WAIT )); then
   log "等待引擎就绪（最多 ${WARMUP_TIMEOUT}s；大模型冷启动通常 5-15 分钟）"
   BASE="http://127.0.0.1:$PORT"
-  if ! wait_http "$BASE/health" "$WARMUP_TIMEOUT" 200; then
+  # 就绪判定在 common.sh::wait_engine_ready（与 wait_ready.sh 共用，含 caps 协商：
+  # 无 api.health 退化端口探测、无 /metrics 面跳过指标等待、ENGINE_METRICS_FETCH_SUFFIX）
+  if wait_engine_ready "$BASE" "$WARMUP_TIMEOUT"; then
+    ok "引擎就绪：$BASE"
+  else
     warn "健康检查超时，最后 30 行日志："
     tail -30 "$LOG_FILE" 2>/dev/null || true
     die "引擎未在 ${WARMUP_TIMEOUT}s 内就绪"
   fi
-  # /health 为 200 后还要等引擎指标出现（就绪指标由厂商 profile 定义）
-  waited=0
-  while (( waited < 120 )); do
-    if curl -s -m 5 "$BASE/metrics" 2>/dev/null | grep -qE "$VENDOR_READY_METRIC"; then break; fi
-    sleep 5; waited=$((waited + 5))
-  done
-  ok "引擎就绪：$BASE （耗时约 ${waited}s 的指标等待）"
   log "下一步：scripts/status.sh / scripts/collect_metrics.sh / scripts/probe_all.sh"
 fi

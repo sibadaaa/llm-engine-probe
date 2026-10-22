@@ -264,8 +264,14 @@ def _engine_diff(before: Any, after: Any, duration: float) -> dict[str, Any] | N
 
 
 def _engine_context(cfg: ProbeConfig) -> dict[str, Any]:
-    """套件头部：引擎/缓存配置（能拿到多少写多少）。"""
+    """套件头部：引擎/缓存配置（能拿到多少写多少）。
+
+    注意 ``payload["engine"]`` 本身就是这个上下文 dict（既有 schema，compare 的
+    指标路径 ``("engine", ...)`` 依赖它）——引擎组件 id 记在 ``context["engine"]``
+    （F3 T3.5；取值链 run_meta.json 的 engine → cfg.engine → vllm）。
+    """
     context: dict[str, Any] = {"base_url": cfg.base_url, "model": cfg.model}
+    context["engine"] = str(getattr(cfg, "engine", "") or "vllm")
     try:
         snapshot = fetch_metrics(cfg)
         family = snapshot.family("vllm:cache_config_info")
@@ -280,6 +286,8 @@ def _engine_context(cfg: ProbeConfig) -> dict[str, Any]:
             context["probe_level"] = meta.get("probe_level")
             context["command"] = meta.get("command")
             context["image"] = meta.get("image")
+            if meta.get("engine"):
+                context["engine"] = meta["engine"]
             # 运行方式：docker（默认，兼容旧 run_meta）| host（物理机直接跑）
             context["runtime"] = meta.get("runtime") or "docker"
             if isinstance(meta.get("host"), dict):

@@ -9,6 +9,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
 
+# 引擎组件：加载 profile（ENGINE != vllm 时版本探测改走 ENGINE_VERSION_CMD；未知 ENGINE die）
+engine_meta
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --port) PORT="${2:?}"; shift 2 ;;
@@ -53,8 +56,18 @@ if runtime_is_host; then
   fi
   HOST_PY="$(host_python 2>/dev/null || echo python3)"
   echo "  HOST_PYTHON：$HOST_PY"
-  # 版本探测与真实启动同环境（source prelude + host PYTHONPATH），避免假失败
-  echo "  vLLM 版本：$(host_exec "$HOST_PY" -c 'import vllm; print(vllm.__version__)' 2>/dev/null || echo '未知（HOST_PYTHON 环境里 import vllm 失败；检查 HOST_PRELUDE_FILES / SRC_DIR）')"
+  # 版本探测与真实启动同环境（source prelude + host PYTHONPATH），避免假失败。
+  # 引擎身份（T1.9）：ENGINE != vllm 时改走引擎 profile 的 ENGINE_VERSION_CMD（无则注记跳过）；
+  # ENGINE=vllm 保持原 import vllm 探测不变。
+  if [[ "$ENGINE" == "vllm" ]]; then
+    echo "  vLLM 版本：$(host_exec "$HOST_PY" -c 'import vllm; print(vllm.__version__)' 2>/dev/null || echo '未知（HOST_PYTHON 环境里 import vllm 失败；检查 HOST_PRELUDE_FILES / SRC_DIR）')"
+  elif [[ -n "$ENGINE_VERSION_CMD" ]]; then
+    # shellcheck disable=SC2086  # ENGINE_VERSION_CMD 按空白切分为命令 + 参数
+    ENGINE_VERSION_OUT="$(host_exec $ENGINE_VERSION_CMD 2>/dev/null | head -n 1 || true)"
+    echo "  引擎版本（ENGINE=$ENGINE，via $ENGINE_VERSION_CMD）：${ENGINE_VERSION_OUT:-未知（ENGINE_VERSION_CMD 未取到输出；见 docs/design/strata-engine/施工图.md T2.5 真机核对清单）}"
+  else
+    echo "  引擎版本：未知（ENGINE=$ENGINE 未声明 ENGINE_VERSION_CMD；引擎预检可改走 /props 元数据）"
+  fi
   # 进程表（pid/etime/args）：优先看 start_vllm.sh --host 记录的本实例（serve.pid），
   # 没有本工具启动的实例时，只读地列出宿主机上按 pattern 能匹配到的 vLLM 进程（诊断用）。
   if host_instance_running 2>/dev/null; then
@@ -63,7 +76,7 @@ if runtime_is_host; then
     printf '  %-9s %-10s %s\n' "PID" "ELAPSED" "ARGS"
     ps -o pid=,etime=,args= -p "$INSTANCE_PID" 2>/dev/null | cut -c1-200 | sed 's/^[[:space:]]*/  /' || true
   elif [[ -n "$HOST_VLLM_PIDS" ]]; then
-    echo "  --- 宿主机上匹配 vLLM 的进程（pgrep -f \"${HOST_VLLM_PATTERN:-…}\"） ---"
+    echo "  --- 宿主机上匹配引擎的进程（pgrep -f \"$(engine_process_pattern)\"） ---"
     printf '  %-9s %-10s %s\n' "PID" "ELAPSED" "ARGS"
     while IFS= read -r _pid; do
       [[ -n "$_pid" ]] || continue
@@ -78,7 +91,7 @@ echo "===================== 端点 ====================="
 # 这里不能再 `|| echo 000`（会变成 000000），只用 `|| true` 防止 set -e 退出。
 printf '%-28s %s\n' "/health" "$(curl -s -o /dev/null -w '%{http_code}' -m 5 "${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"}" "$BASE/health" 2>/dev/null || true)"
 printf '%-28s %s\n' "/v1/models" "$(curl -s -o /dev/null -w '%{http_code}' -m 5 "${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"}" "$BASE/v1/models" 2>/dev/null || true)"
-printf '%-28s %s\n' "/metrics" "$(curl -s -o /dev/null -w '%{http_code}' -m 10 "${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"}" "$BASE/metrics" 2>/dev/null || true)"
+printf '%-28s %s\n' "/metrics" "$(curl -s -o /dev/null -w '%{http_code}' -m 10 "${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"}" "$BASE/metrics${ENGINE_METRICS_FETCH_SUFFIX:-}" 2>/dev/null || true)"
 # 只读探活：用 GET 而不是 POST /start_profile（对生产实例绝无副作用）。
 # 404=未配置 profiler；405/200/400=路由存在；其它按原样显示。
 printf '%-28s %s\n' "/start_profile(profiler，只读探活)" \
@@ -86,7 +99,8 @@ printf '%-28s %s\n' "/start_profile(profiler，只读探活)" \
 
 echo
 echo "===================== 关键指标 ====================="
-if curl -s -m 10 "${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"}" "$BASE/metrics" > /tmp/.vllm_probe_metrics 2>/dev/null; then
+# /metrics 抓取带引擎 profile 的后缀（F3 T3.6；ENGINE=vllm 时为空串，行为不变）
+if curl -s -m 10 "${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"}" "$BASE/metrics${ENGINE_METRICS_FETCH_SUFFIX:-}" > /tmp/.vllm_probe_metrics 2>/dev/null; then
   py - <<'PY'
 import sys
 from probe.metrics_probe import parse_metrics_text, engine_state

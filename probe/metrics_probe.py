@@ -185,16 +185,24 @@ class MetricsSnapshot:
     def load(cls, path: str | Path) -> "MetricsSnapshot":
         return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
 
-    def save_tsv(self, path: str | Path, only_vllm: bool = True) -> Path:
+    def save_tsv(self, path: str | Path, only_vllm: bool = True, name_prefix: str = "vllm:") -> Path:
+        """TSV 导出。``name_prefix`` 来自引擎 profile 的指标前缀（F3 T3.3）；
+        默认 ``"vllm:"`` 保持 vLLM 场景行为不变。meta.engine_extra 存在时
+        （F3 T3.8 显式开启）在文件末尾追加引擎专有指标的行。"""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         lines = ["name\tlabels\tvalue"]
         for fam in self.families.values():
             for s in fam.series:
-                if only_vllm and not s.name.startswith("vllm:"):
+                if only_vllm and not s.name.startswith(name_prefix):
                     continue
                 labels = ",".join(f"{k}={v}" for k, v in sorted(s.labels.items()))
                 lines.append(f"{s.name}\t{labels}\t{s.value}")
+        extra = (self.meta or {}).get("engine_extra") or {}
+        for fam_name, fam in sorted((extra.get("families") or {}).items()):
+            for s in fam.get("series", []):
+                labels = ",".join(f"{k}={v}" for k, v in sorted((s.get("labels") or {}).items()))
+                lines.append(f"{s.get('name') or fam_name}\t{labels}\t{s.get('value')}")
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return path
 
@@ -301,19 +309,61 @@ def histogram_quantile(fam: Family | None, q: float, **labels: str) -> float | N
     return histogram_quantile_detail(fam, q, **labels).value
 
 
+def collect_engine_extras(snap: MetricsSnapshot, profile: Any) -> dict[str, Any]:
+    """按引擎 profile 的 ``extra_metric_families`` 前缀采集专有指标（F3 T3.8）。
+
+    返回结构落进快照 JSON 的 ``meta.engine_extra`` 段；profile 无采集面（如 vllm）
+    或无命中时返回空 dict（产物里不出现该段，默认关闭时 schema 不变）。
+    """
+    prefixes = tuple(getattr(profile, "extra_metric_families", None) or ())
+    if not prefixes:
+        return {}
+    families: dict[str, Any] = {}
+    for name, fam in snap.families.items():
+        if not any(name.startswith(prefix) for prefix in prefixes):
+            continue
+        families[name] = {
+            "type": fam.type,
+            "help": fam.help,
+            "series": [{"name": s.name, "labels": s.labels, "value": s.value} for s in fam.series],
+        }
+    if not families:
+        return {}
+    return {"families": families}
+
+
 def fetch_metrics(cfg: ProbeConfig, timeout: float | None = None) -> MetricsSnapshot:
-    """抓取并解析 ``/metrics``（在线模式下使用）。"""
+    """抓取并解析 ``/metrics``（在线模式下使用）。
+
+    F3 T3.3：URL 追加引擎 profile 的抓取后缀（如 Strata 的 ``?format=prometheus``，
+    其 /metrics 默认回 JSON）；metrics 形态非 none 的引擎加 ``Accept: text/plain``
+    请求头（vLLM 忽略该头，行为不变）。
+    """
     import urllib.request
 
-    headers = {"Accept": "text/plain"}
+    from .engines import profile_for_config
+
+    profile = profile_for_config(cfg)
+    url = cfg.metrics_url + (profile.metrics_fetch_suffix or "")
+    headers: dict[str, str] = {}
+    if profile.metrics_flavor != "none":
+        headers["Accept"] = "text/plain"
     # 反代/网关可能要求鉴权；实例开了 --api-key 时带上
     headers.update(cfg.auth_headers())
-    request = urllib.request.Request(cfg.metrics_url, headers=headers)
+    request = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(request, timeout=timeout or min(cfg.timeout, 30)) as resp:
         text = resp.read().decode("utf-8", errors="replace")
         snap = parse_metrics_text(
-            text, meta={"url": cfg.metrics_url, "bytes": len(text)}
+            text, meta={"url": url, "bytes": len(text)}
         )
+    # 引擎专有指标采集（F3 T3.8）：显式开启（--engine-extras / PROBE_ENGINE_EXTRAS=1）
+    # 且 profile 声明了采集面时，把命中族写进 meta.engine_extra（默认关闭，schema 不变）
+    if getattr(cfg, "engine_extras", False):
+        from .engines import profile_for_config
+
+        extras = collect_engine_extras(snap, profile_for_config(cfg))
+        if extras:
+            snap.meta["engine_extra"] = extras
     return snap
 
 
@@ -486,8 +536,13 @@ def diff_snapshots(
     after: MetricsSnapshot,
     elapsed_s: float,
     model: str | None = None,
+    name_prefix: str = "vllm:",
 ) -> dict[str, Any]:
-    """计算计数器增量与速率（用于一次探测前后对比）。"""
+    """计算计数器增量与速率（用于一次探测前后对比）。
+
+    ``name_prefix``：直方图差分的名字过滤前缀，来自引擎 profile（F3 T3.3）；
+    默认 ``"vllm:"`` 保持 vLLM 场景行为不变（vllm-named 引擎如 Strata 结果一致）。
+    """
     result: dict[str, Any] = {"elapsed_s": elapsed_s, "counters": {}, "rates": {}, "histograms": {}}
     names = set(before.families) | set(after.families)
     for name in sorted(names):
@@ -500,7 +555,7 @@ def diff_snapshots(
             delta = fa.total() - fb.total()
             result["counters"][name] = delta
             result["rates"][name] = delta / elapsed_s if elapsed_s > 0 else None
-        elif fb.type == "histogram" and name.startswith("vllm:"):
+        elif fb.type == "histogram" and name.startswith(name_prefix):
             cb = sum(s.value for s in fb.series if s.name.endswith("_count"))
             ca = sum(s.value for s in fa.series if s.name.endswith("_count"))
             sb = sum(s.value for s in fb.series if s.name.endswith("_sum"))
@@ -526,6 +581,8 @@ def diff_snapshots(
 def save_snapshot(cfg: ProbeConfig, tag: str = "metrics") -> tuple[Path, MetricsSnapshot]:
     import time as _time
 
+    from .engines import effective_metric_prefix, profile_for_config
+
     snap = fetch_metrics(cfg)
     snap.meta.update(
         {
@@ -537,7 +594,8 @@ def save_snapshot(cfg: ProbeConfig, tag: str = "metrics") -> tuple[Path, Metrics
         }
     )
     json_path = snap.save(cfg.out_path(f"{tag}.json"))
-    snap.save_tsv(cfg.out_path(f"{tag}.tsv"))
+    snap.save_tsv(cfg.out_path(f"{tag}.tsv"),
+                  name_prefix=effective_metric_prefix(profile_for_config(cfg)))
     return json_path, snap
 
 

@@ -432,6 +432,88 @@ class HttpProbeTests(unittest.TestCase):
         self.assertIsNotNone(result.error)
 
 
+class EngineCompatTests(unittest.TestCase):
+    """F3：引擎能力协商的解析层单测（strata 指标子集 / 请求体 / delta 键 / 降级摘要）。"""
+
+    def test_strata_metrics_subset_parses(self) -> None:
+        """strata flavor 的 /metrics 文本：vLLM 名子集 + strata: 专有族都能解析。"""
+        import mock_vllm_server
+
+        text = mock_vllm_server._strata_metrics_view(mock_vllm_server.metrics_text())
+        snap = parse_metrics_text(text)
+        for name in (
+            "vllm:num_requests_running", "vllm:kv_cache_usage_perc",
+            "vllm:time_to_first_token_seconds", "vllm:inter_token_latency_seconds",
+            "vllm:e2e_request_latency_seconds", "vllm:spec_decode_num_drafts_total",
+            "strata:live_tok_s", "strata:last_hit_rate", "strata:gpu_util",
+        ):
+            self.assertIsNotNone(snap.family(name), f"strata 指标缺 {name}")
+        for missing in (
+            "vllm:cache_config_info", "vllm:request_queue_time_seconds",
+            "vllm:request_prefill_time_seconds", "vllm:kv_block_lifetime_seconds",
+            "vllm:num_preemptions_total",
+        ):
+            self.assertIsNone(snap.family(missing), f"strata 不应有 {missing}")
+        # strata:last_hit_rate 可被报告读取（专家缓存命中率）
+        fam = snap.family("strata:last_hit_rate")
+        self.assertAlmostEqual(fam.series[0].value, 0.83)
+
+    def test_json_metrics_response_tolerated(self) -> None:
+        """/metrics 默认回 JSON 的引擎（不带后缀抓到 JSON）不应崩，解析为空快照。"""
+        snap = parse_metrics_text('{"error": "use format=prometheus"}')
+        self.assertEqual(snap.families, {})
+
+    def test_build_body_uses_profile_extras(self) -> None:
+        """chat 请求体注入走 profile：vllm=chat_template_kwargs 嵌套；strata=顶层键。"""
+        from probe.http_probe import _build_body
+
+        cfg_vllm = ProbeConfig(model="m", engine="vllm")
+        body = _build_body(cfg_vllm, "p", 8, stream=False)
+        self.assertEqual(body["chat_template_kwargs"], {"reasoning_effort": "low"})
+        self.assertNotIn("reasoning_effort", body)
+
+        cfg_strata = ProbeConfig(model="m", engine="strata")
+        body = _build_body(cfg_strata, "p", 8, stream=False)
+        self.assertEqual(body["reasoning_effort"], "low")
+        self.assertNotIn("chat_template_kwargs", body)
+
+    def test_absorb_chunk_delta_keys(self) -> None:
+        """delta 内容键按 profile：strata 集只认 content/reasoning_content；
+        vLLM 集还认 reasoning（qwen3 parser 形态）。"""
+        from probe.http_probe import _absorb_chunk
+
+        result = RequestResult(index=0)
+        got = _absorb_chunk(
+            result,
+            {"choices": [{"delta": {"reasoning_content": "think"}}]},
+            content_keys=("content", "reasoning_content"),
+        )
+        self.assertTrue(got)
+        got2 = _absorb_chunk(
+            result,
+            {"choices": [{"delta": {"reasoning": "qwen3-style"}}]},
+            content_keys=("content", "reasoning_content"),
+        )
+        self.assertFalse(got2, "strata 集不应把 reasoning 键当内容")
+        got3 = _absorb_chunk(
+            result,
+            {"choices": [{"delta": {"reasoning": "qwen3-style"}}]},
+            content_keys=("content", "reasoning_content", "reasoning"),
+        )
+        self.assertTrue(got3, "vLLM 集应认 reasoning 键")
+
+    def test_strata_summary_degrades(self) -> None:
+        """无 obs.per-request-metrics 能力的引擎：逐请求摘要直接 available=False。"""
+        cfg = ProbeConfig(model="m", engine="strata")
+        results = [request_once(cfg, index=0, prompt="ping", max_tokens=4)]
+        # 无服务端时 request 会失败，这里直接构造 ok 结果驱动 summarize 的摘要分支
+        ok_result = RequestResult(index=0, ok=True)
+        summary = summarize([ok_result], cfg)
+        self.assertFalse(summary["server_side"]["available"])
+        self.assertIn("obs.per-request-metrics", summary["server_side"]["hint"])
+        self.assertFalse(summary["spec_decode"]["available"])
+
+
 # ---------------------------------------------------------------------------
 # 报告层
 # ---------------------------------------------------------------------------
