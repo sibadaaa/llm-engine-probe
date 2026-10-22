@@ -92,7 +92,7 @@ EXPECTED_TEMPLATES=(
   quant/fp8 quant/int8-w8a8 quant/w4a16 quant/awq
   spec/dflash spec/mtp spec/eagle spec/ngram
   deploy/pd-prefill deploy/pd-decode deploy/multinode-head deploy/multinode-worker
-  engine/vllm engine/strata
+  engine/vllm engine/strata engine/sglang engine/llamacpp engine/ollama
 )
 have_template() { # $1=模板名（如 vendor/hygon）
   [[ -f "hosts/$1.env" ]]
@@ -381,10 +381,16 @@ else
     ["spec/mtp"]='"method":"mtp"'
     ["quant/fp8"]='--quantization fp8'
     ["engine/strata"]='ENGINE=strata'
+    ["engine/sglang"]='ENGINE=sglang'
+    ["engine/llamacpp"]='ENGINE=llamacpp'
+    ["engine/ollama"]='ENGINE=ollama'
   )
   declare -A DRY_EXPECT_DESC2=(
     ["spec/ngram"]='"method":"ngram"'
     ["engine/strata"]='strata launch'
+    ["engine/sglang"]='sglang.launch_server'
+    ["engine/llamacpp"]='llama-server'
+    ["engine/ollama"]='ollama serve'
   )
 
   for name in "${TEMPLATE_NAMES[@]}"; do
@@ -424,7 +430,7 @@ else
         chk_fail "dry-run $name 的 serve_launch.sh 缺模型身份（export MODEL 或命令行；engine=$launch_engine）"; dump_tail "$launch"
       fi
       case "$name" in
-        vendor/hygon|scenario/tp4-prod|spec/dflash|spec/ngram|spec/mtp|quant/fp8|engine/strata)
+        vendor/hygon|scenario/tp4-prod|spec/dflash|spec/ngram|spec/mtp|quant/fp8|engine/strata|engine/sglang|engine/llamacpp|engine/ollama)
           desc="${DRY_EXPECT_DESC[$name]}"
           if file_contains_fragment "$launch" "$desc"; then
             chk_pass "$name 的 serve_launch.sh 含 $desc"
@@ -483,20 +489,26 @@ if have_template engine/vllm; then
   fi
 fi
 
-# 引擎无 docker 能力时，RUNTIME=docker 必须 die 且文案含 "docker"（F2 T2.3）。
+# 无 docker 能力的引擎，RUNTIME=docker 必须 die 且文案含 "docker"（F2 T2.3 + 引擎扩展）。
 # 注意：hosts/vllm-host.sh 是物理机入口、恒以 --host 调 start_vllm.sh，
 # 因此 docker 门禁用 scripts/start_vllm.sh 直调验证。
-STRAITA_OUT="$TMP/engine-strata-docker.out"
-strata_docker_rc=0
-if have_template engine/strata; then
-  RUNTIME=docker ENGINE=strata RUNS_DIR="$RUNS_BASE/engine-strata-docker" MODEL="$DRY_MODEL" \
-    bash scripts/start_vllm.sh --dry-run > "$STRAITA_OUT" 2>&1 || strata_docker_rc=$?
-  if [[ $strata_docker_rc -ne 0 ]] && grep -q 'docker' "$STRAITA_OUT"; then
-    chk_pass "ENGINE=strata RUNTIME=docker 被拒绝且文案含 docker（无 runtime.docker 能力）"
+# 逐个引擎模板校验（都未声明 runtime.docker；若某引擎将来声明了，从列表摘掉即可）：
+for eng_tpl in engine/strata engine/sglang engine/llamacpp engine/ollama; do
+  if ! have_template "$eng_tpl"; then continue; fi
+  eng_id="${eng_tpl#engine/}"
+  ENG_DOCKER_OUT="$TMP/engine-${eng_id}-docker.out"
+  eng_docker_rc=0
+  RUNTIME=docker ENGINE="$eng_id" RUNS_DIR="$RUNS_BASE/engine-${eng_id}-docker" MODEL="$DRY_MODEL" \
+    bash scripts/start_vllm.sh --dry-run > "$ENG_DOCKER_OUT" 2>&1 || eng_docker_rc=$?
+  if [[ $eng_docker_rc -ne 0 ]] && grep -q 'docker' "$ENG_DOCKER_OUT"; then
+    chk_pass "ENGINE=$eng_id RUNTIME=docker 被拒绝且文案含 docker（无 runtime.docker 能力）"
   else
-    chk_fail "ENGINE=strata RUNTIME=docker 未按预期失败（退出码 $strata_docker_rc）"
-    dump_tail "$STRAITA_OUT"
+    chk_fail "ENGINE=$eng_id RUNTIME=docker 未按预期失败（退出码 $eng_docker_rc）"
+    dump_tail "$ENG_DOCKER_OUT"
   fi
+done
+
+if have_template engine/strata; then
 
   # 无 api.openai-completions 能力的引擎：PROBE_ENDPOINT=completions 必须 die（F2 T2.6②）
   STRATA_CP_OUT="$TMP/engine-strata-completions.out"

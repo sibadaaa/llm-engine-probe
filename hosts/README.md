@@ -178,6 +178,9 @@ deploy 模板**保留上游** `EXTRA_VLLM_ARGS`（worker 只追加 `--headless`�
 |---|---|---|
 | [`engine/vllm.env`](engine/vllm.env) | 显式声明 vLLM（占位语义，与不设置等价） | `ENGINE=vllm` |
 | [`engine/strata.env`](engine/strata.env) | 切换到 Strata（MoE 专家分层推理引擎，结构适配） | `ENGINE=strata`、`MODEL` 换成 pack 名、`HOST_ENGINE_PATTERN`（真机核对项见 `docs/design/strata-engine/施工图.md` §4） |
+| [`engine/sglang.env`](engine/sglang.env) | 切换到 SGLang（高性能 OpenAI 兼容推理引擎，结构适配） | `ENGINE=sglang`、`MODEL` 身份记录、推荐入口含 `--enable-metrics`（默认关）、`HOST_SERVE_ENTRYPOINT` 覆盖拉起命令 |
+| [`engine/llamacpp.env`](engine/llamacpp.env) | 切换到 llama.cpp（llama-server GGUF 单节点推理，结构适配） | `ENGINE=llamacpp`、`MODEL` 身份记录、推荐入口含 `--metrics`（默认关）、无跨卡 TP、`HOST_SERVE_ENTRYPOINT` 覆盖拉起命令 |
+| [`engine/ollama.env`](engine/ollama.env) | 切换到 Ollama（本地模型管理/推理服务，OpenAI 兼容层探测） | `ENGINE=ollama`、`MODEL`/`SERVED_NAME` 用 tag 名（需先 `ollama pull`）、`EXTRA_ENV` 传 `OLLAMA_HOST` 对齐 `PORT`、无指标面 |
 
 **链序约定**：引擎模板放最后——`vendor → scenario → quant/spec（vLLM 专属）→ engine`。
 引擎模板负责把模型/并行参数换成该引擎的语义（如 Strata 的 `MODEL` 是 pack 名不是权重路径），
@@ -188,8 +191,9 @@ hosts/vllm-host.sh up engine/strata                     # 单模板
 hosts/vllm-host.sh up vendor/nvidia engine/strata       # 显式指定厂商做遥测
 ```
 
-> 注意：非 vLLM 引擎在 `RUNTIME=docker` 下会被启动链显式拒绝（无官方镜像，
-> 见 `docs/design/README.md` §5 红线 3）；外部已运行的引擎实例请用
+> 注意：非 vLLM 引擎在 `RUNTIME=docker` 下会被启动链显式拒绝（本仓库 `docker/` 暂不做
+> 非 vLLM 引擎适配——多数引擎其实有官方镜像，拒绝属 `docs/design/README.md` §5 红线 3
+> 的仓库策略，非引擎能力缺失）；外部已运行的引擎实例请用
 > `deploy/external-probe.sh` 只读探测。Strata 的完整使用说明（外部只读/host 拉起、
 > 压测语义差异、排障）见 [`../docs/strata-接入指南.md`](../docs/strata-接入指南.md)。
 

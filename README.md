@@ -134,7 +134,7 @@ llm-engine-probe/
 │   ├── README.md                 ← 新增一家厂商的完整指南
 │   ├── _template.sh              ← 适配模板（含每个变量说明）
 │   └── <vendor>.sh               ← 设备直通/环境注入/SMI 命令/探测元数据
-├── engines/                      ← 引擎组件注册表（Shell 端）：vllm（默认）/strata/...
+├── engines/                      ← 引擎组件注册表（Shell 端）：vllm（默认）/strata/sglang/llamacpp/ollama/...
 │   ├── _template.sh              ← 引擎 profile 骨架（含每个字段说明）
 │   └── <engine>.sh               ← serve 入口/进程正则/能力位（caps）；契约见 docs/design/
 ├── hosts/                        ← 物理机启动模板（厂商/场景/量化/投机/部署；模板不侵入核心）

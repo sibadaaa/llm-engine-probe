@@ -208,9 +208,12 @@ class ProfileExtensionTests(unittest.TestCase):
         self.assertEqual(effective_metric_prefix(explicit), "engine:")
 
     def test_env_check_and_delta_keys_non_empty(self) -> None:
+        """env_check_metrics 非空仅在引擎有指标面时要求（flavor=none 无指标可查，
+        如 Ollama 主线无 /metrics）；delta_content_keys 恒非空（流式计数依据）。"""
         for eid in list_engines():
             profile = ENGINE_REGISTRY[eid]
-            self.assertTrue(profile.env_check_metrics, f"{eid}: env_check_metrics 不能为空")
+            if profile.metrics_flavor != "none":
+                self.assertTrue(profile.env_check_metrics, f"{eid}: env_check_metrics 不能为空")
             self.assertTrue(profile.delta_content_keys, f"{eid}: delta_content_keys 不能为空")
 
     def test_strata_python_only_fields(self) -> None:

@@ -82,9 +82,16 @@ def cmd_env(args: argparse.Namespace) -> int:
         checks.append({"name": name, "ok": ok, "detail": detail})
         print(f"[{'✅' if ok else '❌'}] {name}: {detail}")
 
-    # 1) 基本端点（实例开了 --api-key 时也要带鉴权；否则 /v1/models 会 401）
+    # 引擎 profile：健康路径与指标面按引擎协商（F3）；ENGINE=vllm 时取值与历史硬编码
+    # 完全一致（health_path=/health），产物逐字节不变。
+    from .engines import profile_for_config
+
+    profile = profile_for_config(cfg)
+
+    # 1) 基本端点（实例开了 --api-key 时也要带鉴权；否则 /v1/models 会 401）。
+    #    健康检查用 profile.health_path：如 Ollama 无 /health，根路径 GET / 承担就绪。
     auth = cfg.auth_headers()
-    for path, label in (("/health", "健康检查"), ("/v1/models", "模型列表")):
+    for path, label in ((profile.health_path, "健康检查"), (profile.models_path, "模型列表")):
         url = cfg.base_url.rstrip("/") + path
         try:
             request = urllib.request.Request(url, headers=auth)
@@ -96,18 +103,19 @@ def cmd_env(args: argparse.Namespace) -> int:
         except Exception as exc:  # noqa: BLE001
             check(label, False, f"{type(exc).__name__}: {exc}")
 
-    # 2) /metrics
+    # 2) /metrics：flavor=none 的引擎（如 Ollama 主线无 /metrics）显式跳过、有文案，
+    #    不发必然 404 的请求（F3 纪律：降级显式，不静默、不假失败）。
     snap = None
-    try:
-        snap = fetch_metrics(cfg)
-        check("指标端点", True, f"{len(snap.families)} 个指标族")
-    except Exception as exc:  # noqa: BLE001
-        check("指标端点", False, f"{type(exc).__name__}: {exc}")
+    if profile.metrics_flavor == "none":
+        check("指标端点", True, f"引擎 {profile.id} 无 /metrics 指标面（metrics_flavor=none），跳过")
+    else:
+        try:
+            snap = fetch_metrics(cfg)
+            check("指标端点", True, f"{len(snap.families)} 个指标族")
+        except Exception as exc:  # noqa: BLE001
+            check("指标端点", False, f"{type(exc).__name__}: {exc}")
 
     if snap is not None:
-        from .engines import profile_for_config
-
-        profile = profile_for_config(cfg)
         # 可选指标存在性表按引擎 profile 生成（F3 T3.3）；vllm 的名字与提示语和历史
         # 硬编码完全一致（产物逐字节一致），其它引擎用 profile 清单 + 通用提示。
         _metric_hints = {

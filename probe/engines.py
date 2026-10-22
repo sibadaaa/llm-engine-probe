@@ -181,6 +181,120 @@ ENGINE_REGISTRY: dict[str, EngineProfile] = {
         ),
         diagnose_overrides={},
     ),
+    # SGLang（2026-10 接入）：字段与 engines/sglang.sh 逐字段一致（tests/test_engines.py 强制）。
+    # 上游事实：docs.sglang.io / github.com/sgl-project/sglang；⭐ = 真机核对项
+    # （指标名以真机 GET /metrics 实测为准，缺失项探针按缺项容错）。
+    "sglang": EngineProfile(
+        id="sglang",
+        label="SGLang（高性能 OpenAI 兼容推理引擎）",
+        caps=frozenset({
+            "api.openai-chat", "api.openai-completions", "api.models-list", "api.health",
+            "spec.decode", "metrics.prometheus", "runtime.host",
+        }),
+        entrypoint="python3 -m sglang.launch_server",
+        process_pattern=r"sglang",
+        metrics_flavor="prometheus",
+        args_mode="custom",
+        ready_metric=r"^sglang:num_running_reqs",
+        metrics_fetch_suffix="",
+        version_cmd="sglang version",  # 新版 CLI 子命令（无 sglang --version）；旧版无 CLI 按 warn
+        check_severity="warn",
+        report_notes=(
+            "SGLang 为 OpenAI 兼容推理引擎：逐 step / stat-logger / torch profiler / "
+            "图模式观测未接入本工具；/metrics 需启动 flag --enable-metrics（默认关，"
+            "缺失时指标小节为空属预期）；指标为 sglang: 前缀 Prometheus 文本；"
+            "思考内容需 --reasoning-parser 才拆到 reasoning_content（否则混在 content）；"
+            "温度 0 下动态批+radix cache 非确定，严格 A/B 需 "
+            "--enable-deterministic-inference。",
+        ),
+        notes="RadixAttention 前缀缓存 + PD 分离/EP；/metrics 需 --enable-metrics 启动（默认关）；无逐 step 日志/torch profiler 接入面；投机解码（EAGLE/NEXTN/NGRAM）flag 面可用；指标为 sglang: 前缀 Prometheus 文本；显存旋钮是 --mem-fraction-static。",
+        # ---- Python 侧专有（sglang: 前缀过滤；请求体零注入=标准 OpenAI 形态）----
+        metric_prefix="sglang:",      # flavor=prometheus 的派生值是不过滤，这里显式收紧
+        chat_body_extras={},          # reasoning_effort 别同时设服务端默认与请求级，零注入最稳
+        delta_content_keys=("content", "reasoning_content"),
+        env_check_metrics=(
+            "sglang:num_running_reqs",
+            "sglang:num_queue_reqs",
+            "sglang:time_to_first_token_seconds",
+            "sglang:gen_throughput",
+            "sglang:cache_hit_rate",
+        ),
+        extra_metric_families=(),
+        diagnose_overrides={},
+    ),
+    # llama.cpp（2026-10 接入）：字段与 engines/llamacpp.sh 逐字段一致（tests/test_engines.py 强制）。
+    # 上游事实：github.com/ggml-org/llama.cpp tools/server/README.md；⭐ = 真机核对项。
+    "llamacpp": EngineProfile(
+        id="llamacpp",
+        label="llama.cpp（llama-server GGUF 推理）",
+        caps=frozenset({
+            "api.openai-chat", "api.openai-completions", "api.models-list", "api.health",
+            "api.props", "spec.decode", "metrics.prometheus", "runtime.host",
+        }),
+        entrypoint="llama-server",
+        process_pattern=r"llama-server",
+        metrics_flavor="prometheus",
+        args_mode="custom",
+        ready_metric=r"^llamacpp:(n_decode_total|requests_processing|prompt_tokens_total)",
+        metrics_fetch_suffix="",
+        version_cmd="llama-server --version",
+        check_severity="warn",
+        report_notes=(
+            "llama.cpp 为单节点 GGUF 推理：逐 step / stat-logger / torch profiler / "
+            "图模式观测不适用；/metrics 需启动 flag --metrics（默认关，缺失时指标小节为空"
+            "属预期）；指标为 llamacpp: 前缀 Counter/Gauge（无 TTFT/延迟直方图）；"
+            "无跨卡张量并行（--tensor-split 仅显存切分），-c 为总上下文、按 --parallel "
+            "槽位平分；思考模型经 --reasoning-format（默认 auto）输出 reasoning_content"
+            "（TTFT 含思考首 token）。",
+        ),
+        notes="单节点 GGUF 推理：/metrics 需 --metrics 启动（默认关）；-ngl GPU 层数、--parallel 槽位、-c 总上下文按 slots 平分；无跨卡张量并行（--tensor-split 仅显存切分）；--jinja 新版默认开（旧版要显式）；思考模型经 --reasoning-format（默认 auto）输出 reasoning_content。",
+        # ---- Python 侧专有（llamacpp: 前缀过滤；请求体零注入=标准 OpenAI 形态）----
+        metric_prefix="llamacpp:",
+        chat_body_extras={},
+        delta_content_keys=("content", "reasoning_content"),
+        env_check_metrics=(
+            "llamacpp:prompt_tokens_total",
+            "llamacpp:tokens_predicted_total",
+            "llamacpp:n_decode_total",
+        ),
+        extra_metric_families=(),
+        diagnose_overrides={},
+    ),
+    # Ollama（2026-10 接入）：字段与 engines/ollama.sh 逐字段一致（tests/test_engines.py 强制）。
+    # 上游事实：github.com/ollama/ollama / docs.ollama.com；主线无 /metrics
+    # （指标 PR #16998/#18508 尚未合并，合并后按 prometheus flavor 回填）。
+    "ollama": EngineProfile(
+        id="ollama",
+        label="Ollama（本地模型管理/推理服务）",
+        caps=frozenset({
+            "api.openai-chat", "api.openai-completions", "api.models-list", "api.health",
+            "runtime.host",
+        }),
+        entrypoint="ollama serve",
+        process_pattern=r"ollama",
+        metrics_flavor="none",        # 主线无 /metrics：探针跳过指标面，就绪只看 GET /
+        args_mode="custom",
+        health_path="/",              # 无 /health；根路径 200 "Ollama is running" 承担就绪判定
+        ready_metric="",              # 无指标面：就绪判定只走 health_path 轮询
+        version_cmd="ollama --version",
+        check_severity="warn",
+        report_notes=(
+            "Ollama 为本地模型管理/推理服务：无 /metrics 指标面，本报告无服务端指标小节"
+            "（时延/吞吐均为客户端口径）；逐 step / 投机解码 / 图模式观测不适用；"
+            "并发默认 1（OLLAMA_NUM_PARALLEL，压测前显式设置并注意 KV 显存随 "
+            "num_ctx×parallel 膨胀）；keep_alive 默认 5m 到期卸载模型（长压测 "
+            "OLLAMA_KEEP_ALIVE=-1）；思考内容在 delta.reasoning 字段（探针已计入），"
+            "/v1 层用 reasoning_effort:\"none\" 关闭思考。",
+        ),
+        notes="模型以 tag 名寻址（需先 ollama pull）；无 /metrics 指标面（探测只走 HTTP 时延/吞吐）；并发默认 1（OLLAMA_NUM_PARALLEL）；keep_alive 默认 5m 到期卸载；思考内容在 delta.reasoning 字段。",
+        # ---- Python 侧专有（无指标面：过滤与 env 指标表均为空）----
+        metric_prefix="",
+        chat_body_extras={},          # /v1 层不接受 think 字段（400 风险），零注入
+        delta_content_keys=("content", "reasoning"),  # 上游思考流在 delta.reasoning（非 reasoning_content）
+        env_check_metrics=(),         # flavor=none 无指标存在性表可查（测试按 flavor 放行）
+        extra_metric_families=(),
+        diagnose_overrides={},
+    ),
 }
 
 
