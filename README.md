@@ -1,7 +1,8 @@
 # llm-engine-probe · 大模型推理引擎探测工具箱（当前主 vLLM，多厂商）
 
-> 定位：引擎无关的推理探测/调优工具箱。当前实现以 vLLM 为主；后续计划支持
-> SGLang / TensorRT-LLM 等多引擎（探针与报告围绕 HTTP/OpenAI 兼容接口设计，引擎层通过适配器扩展）。
+> 定位：引擎无关的推理探测/调优工具箱。观测纵深以 vLLM 为主（逐 step/算子级），同时内置
+> **Strata / SGLang / llama.cpp / Ollama** 引擎组件（`ENGINE` 切换，能力位协商，见 §4c）；
+> 后续计划 TensorRT-LLM 等（探针与报告围绕 HTTP/OpenAI 兼容接口设计，引擎层通过适配器扩展）。
 
 在 Docker 中启动一个**可观测的 vLLM 实例**，并把一次推理从「HTTP 请求 → 调度排队 → 预填充 → 解码 → 投机解码验证 → GPU kernel」的**每一步**都采出来，最后汇总成一份中文 Markdown 报告，直接告诉你下一步该优化什么。
 
@@ -273,6 +274,41 @@ make up-kernel
 
 ---
 
+## 4c. 多引擎组件层（engines/ ↔ `ENGINE`）
+
+### 内置引擎矩阵
+
+| 引擎 | `ENGINE=` | 指标面 | OpenAI API 面 | 投机解码 | 运行方式 | 适配程度 |
+|---|---|---|---|---|---|---|
+| vLLM | `vllm`（默认） | `vllm:` 全套（默认开） | chat/completions/models/props | ✓ | docker + host | 深度观测（基线） |
+| Strata | `strata` | vLLM 名（需 `?format=prometheus`，探针自动加） | chat/models（无 completions） | ✓（MTP） | host | 结构适配 |
+| SGLang | `sglang` | `sglang:` 前缀 Prometheus（**需 `--enable-metrics` 启动，默认关**） | chat/completions/models | ✓（EAGLE/NEXTN/NGRAM） | host | 结构适配 |
+| llama.cpp | `llamacpp` | `llamacpp:` 前缀 Prometheus（**需 `--metrics` 启动，默认关**） | chat/completions/models/props | ✓（`--model-draft`） | host | 结构适配 |
+| Ollama | `ollama` | **无**（主线无 `/metrics`，上游指标 PR 未合并） | chat/completions/models | ✗ | host | 结构适配 |
+
+探针按**能力位（caps）**协商：引擎缺什么观测面，报告/套件对应小节给**显式降级注记**而非空白
+或假失败；`RUNTIME=docker` 下非 vLLM 引擎启动链显式拒绝（本仓库 `docker/` 暂不做非 vLLM
+适配——属仓库策略，非引擎能力缺失）。
+
+### 用法
+
+```bash
+python3 -m probe engine                                # 当前引擎能力位/入口/指标形态
+ENGINE=sglang python3 -m probe http --port 30000       # 外部已运行实例：显式指定引擎
+hosts/vllm-host.sh up engine/sglang                    # 物理机拉起（引擎模板放链尾）
+hosts/vllm-host.sh up vendor/nvidia engine/ollama      # 遥测照常按 VENDOR 叠加
+```
+
+* 引擎模板负责把模型/并行参数换成引擎语义（llama.cpp 是 GGUF 文件、Ollama 是 registry
+  tag 名、SGLang 是 HF 路径）；真机拉起命令经 `HOST_SERVE_ENTRYPOINT` 覆盖，先 `dry-run`
+  复核拼装——模板清单与链序见 [`hosts/README.md`](hosts/README.md) §3.8；
+* 外部已运行的实例用 `deploy/external-probe.sh` 只读探测（不要在目标机 `up`）；
+* 每引擎的上游事实与 ⭐ 真机核对项见 `engines/<id>.sh` 注释；指标字段对照见
+  [`docs/观测字段对照表.md`](docs/观测字段对照表.md) §3b/3c/3d/3e；
+* 新增引擎 = 三份新文件 + 两行索引，流程见 [`docs/design/README.md`](docs/design/README.md) §4。
+
+---
+
 ## 5. 命令速查
 
 ### 运行方式：`RUNTIME=docker`（默认）| `host`
@@ -370,10 +406,10 @@ python3 -m probe compare   --a runs/a/suite_results.json --b runs/b/suite_result
 python3 -m probe report    --outdir runs/x
 ```
 
-> 多引擎支持（`ENGINE=vllm|strata|...`，引擎组件即插即用接口）：设计契约与接入三步见
-> [`docs/design/`](docs/design/README.md)（F1 组件接口 / F2 Strata 适配 / F3 观测面兼容）；
-> 探针默认行为只假设"OpenAI 兼容 API + /metrics"，差异全部走引擎能力位（caps）协商。
-> Strata 的完整接入说明见 [`docs/strata-接入指南.md`](docs/strata-接入指南.md)。
+> 多引擎支持（`ENGINE=vllm|strata|sglang|llamacpp|ollama`，引擎组件即插即用接口）：设计契约与
+> 接入三步见 [`docs/design/`](docs/design/README.md)（F1 组件接口 / F2 Strata 适配 / F3 观测面兼容），
+> 内置引擎矩阵见 §4c；探针默认行为只假设"OpenAI 兼容 API + /metrics"，差异全部走引擎能力位
+> （caps）协商。Strata 的完整接入说明见 [`docs/strata-接入指南.md`](docs/strata-接入指南.md)。
 
 ---
 
